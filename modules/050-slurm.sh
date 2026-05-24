@@ -6,18 +6,18 @@ set -Eeuo pipefail
 # File: modules/050-slurm.sh
 #
 # Purpose:
-#   Configure Slurm + Munge + MariaDB accounting + Environment Modules + MPI
-#   with reusable HPC user access management.
+#   Slurm + Munge + MariaDB accounting + Environment Modules + MPI
+#   for CAPAC 2-node CAE/HPC CFD cluster.
 #
-# Cluster:
-#   Master/controller/compute : cae-01 / 192.168.2.131
-#   Compute node              : cae-03 / 192.168.2.133
+# Nodes:
+#   cae-01 / 192.168.2.131 : master + compute
+#   cae-03 / 192.168.2.133 : compute
 #
 # Access model:
-#   - Shared group: hpc
-#   - Default job user: cadfem
-#   - Slurm service user: slurm
-#   - Any future user added to hpc can run jobs and access shared directories
+#   hpc group controls job-user access.
+#   cadfem and slurm are added to hpc.
+#   Future users can be added using:
+#     sudo capac-add-hpc-user <username>
 #
 # Required function:
 #   slurm_main()
@@ -41,11 +41,12 @@ slurm_main() {
   slurm_setup_root_ssh_if_master
   slurm_sync_to_compute_if_master
   slurm_enable_services
+  slurm_enable_boot_persistence
   slurm_register_accounting_if_master
   slurm_create_test_jobs_if_master
   slurm_summary
 
-  log_ok "Slurm + Munge + MariaDB + Environment Modules + HPC Access completed successfully."
+  log_ok "Slurm module completed successfully."
 }
 
 # ------------------------------------------------------------------------------
@@ -53,8 +54,6 @@ slurm_main() {
 # ------------------------------------------------------------------------------
 
 slurm_set_defaults() {
-  log_section "Loading Slurm Cluster Defaults"
-
   CLUSTER_NAME="${CLUSTER_NAME:-capac-hpc}"
   PARTITION_NAME="${PARTITION_NAME:-cfd}"
 
@@ -84,24 +83,24 @@ slurm_set_defaults() {
   INTEL_ONEAPI_ROOT="${INTEL_ONEAPI_ROOT:-/opt/intel/oneapi}"
   INSTALL_INTEL_MPI="${INSTALL_INTEL_MPI:-ask}"
 
-  log_info "Cluster name      : ${CLUSTER_NAME}"
-  log_info "Partition         : ${PARTITION_NAME}"
-  log_info "Master            : ${MASTER_HOST} / ${MASTER_IP}"
-  log_info "Compute           : ${COMPUTE_HOST} / ${COMPUTE_IP}"
-  log_info "Node CPUs         : ${NODE_CPUS}"
-  log_info "Node RealMemory   : ${NODE_REALMEMORY} MB"
-  log_info "Run user          : ${RUN_USER}"
-  log_info "Slurm user        : ${SLURM_USER}"
-  log_info "HPC group         : ${HPC_GROUP}"
-  log_info "App path          : ${SHARED_APP_PATH}"
-  log_info "Data path         : ${SHARED_DATA_PATH}"
-  log_info "Scratch path      : ${SHARED_SCRATCH_PATH}"
-  log_info "Modulefiles path  : ${MODULEFILES_PATH}"
-  log_info "Intel oneAPI root : ${INTEL_ONEAPI_ROOT}"
+  log_section "Slurm Defaults"
+  log_info "Cluster          : ${CLUSTER_NAME}"
+  log_info "Partition        : ${PARTITION_NAME}"
+  log_info "Master           : ${MASTER_HOST} / ${MASTER_IP}"
+  log_info "Compute          : ${COMPUTE_HOST} / ${COMPUTE_IP}"
+  log_info "CPUs per node    : ${NODE_CPUS}"
+  log_info "Memory per node  : ${NODE_REALMEMORY} MB"
+  log_info "Run user         : ${RUN_USER}"
+  log_info "Slurm user       : ${SLURM_USER}"
+  log_info "HPC group        : ${HPC_GROUP}"
+  log_info "Apps path        : ${SHARED_APP_PATH}"
+  log_info "Modulefiles path : ${MODULEFILES_PATH}"
+  log_info "Data path        : ${SHARED_DATA_PATH}"
+  log_info "Scratch path     : ${SHARED_SCRATCH_PATH}"
 }
 
 # ------------------------------------------------------------------------------
-# Input Helpers
+# Input helpers
 # ------------------------------------------------------------------------------
 
 slurm_read_tty() {
@@ -118,67 +117,44 @@ slurm_read_tty() {
 slurm_confirm() {
   local prompt="$1"
   local answer
-
   slurm_read_tty "${prompt}" answer
 
   case "${answer}" in
-    y|Y|yes|YES)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
 # ------------------------------------------------------------------------------
-# Role Detection
+# Role / host
 # ------------------------------------------------------------------------------
 
 slurm_detect_role() {
-  log_section "Detecting Node Role"
+  log_section "Detecting Slurm Node Role"
 
   SHORT_HOST="$(hostname -s)"
 
   case "${SHORT_HOST}" in
-    "${MASTER_HOST}")
-      NODE_ROLE="master"
-      ;;
-    "${COMPUTE_HOST}")
-      NODE_ROLE="compute"
-      ;;
+    "${MASTER_HOST}") NODE_ROLE="master" ;;
+    "${COMPUTE_HOST}") NODE_ROLE="compute" ;;
     *)
       log_warn "Unknown hostname: ${SHORT_HOST}"
-      log_warn "Expected ${MASTER_HOST} or ${COMPUTE_HOST}"
-
-      local manual_role
-      slurm_read_tty "Enter node role manually [master/compute]: " manual_role
-
-      case "${manual_role}" in
-        master|compute)
-          NODE_ROLE="${manual_role}"
-          ;;
-        *)
-          log_error "Invalid role: ${manual_role}"
-          return 1
-          ;;
-      esac
+      slurm_read_tty "Enter role manually [master/compute]: " NODE_ROLE
+      [[ "${NODE_ROLE}" == "master" || "${NODE_ROLE}" == "compute" ]] || {
+        log_error "Invalid role: ${NODE_ROLE}"
+        return 1
+      }
       ;;
   esac
 
-  log_ok "Detected node role: ${NODE_ROLE}"
+  log_ok "Node role: ${NODE_ROLE}"
 }
 
 slurm_validate_hostname() {
   log_section "Validating Hostname"
-
   log_info "hostname -s: $(hostname -s)"
   log_info "hostname -f: $(hostname -f 2>/dev/null || hostname)"
 }
-
-# ------------------------------------------------------------------------------
-# Hosts
-# ------------------------------------------------------------------------------
 
 slurm_configure_hosts() {
   log_section "Configuring /etc/hosts"
@@ -195,9 +171,10 @@ ${MASTER_IP} ${MASTER_HOST}
 ${COMPUTE_IP} ${COMPUTE_HOST}
 EOF
 
-  log_ok "/etc/hosts updated."
   getent hosts "${MASTER_HOST}" | tee -a "${LOG_FILE}" || true
   getent hosts "${COMPUTE_HOST}" | tee -a "${LOG_FILE}" || true
+
+  log_ok "/etc/hosts configured."
 }
 
 # ------------------------------------------------------------------------------
@@ -205,7 +182,7 @@ EOF
 # ------------------------------------------------------------------------------
 
 slurm_install_packages() {
-  log_section "Installing Slurm, Munge, MariaDB, Environment Modules and MPI Packages"
+  log_section "Installing Slurm Stack Packages"
 
   dnf install -y epel-release dnf-plugins-core yum-utils || true
   dnf config-manager --set-enabled powertools 2>/dev/null || true
@@ -214,37 +191,17 @@ slurm_install_packages() {
   dnf makecache -y || true
 
   dnf install -y \
-    munge \
-    munge-libs \
-    munge-devel \
-    environment-modules \
-    acl \
-    hwloc \
-    hwloc-libs \
-    numactl \
-    numactl-libs \
-    pmix \
-    pmix-devel \
-    openmpi \
-    openmpi-devel \
-    mariadb \
-    mariadb-server \
-    mariadb-devel \
-    perl \
-    perl-DBI \
-    perl-DBD-MySQL \
-    python3 \
-    python3-pip \
-    jq \
-    rsync \
-    openssh-clients \
-    openssh-server \
-    which \
-    wget \
-    curl \
-    tar \
-    gzip \
-    openssl || true
+    munge munge-libs munge-devel \
+    environment-modules acl \
+    hwloc hwloc-libs \
+    numactl numactl-libs \
+    pmix pmix-devel \
+    openmpi openmpi-devel \
+    mariadb mariadb-server mariadb-devel \
+    perl perl-DBI perl-DBD-MySQL \
+    python3 python3-pip \
+    jq rsync openssh-clients openssh-server \
+    which wget curl tar gzip openssl || true
 
   dnf install -y \
     slurm \
@@ -253,51 +210,39 @@ slurm_install_packages() {
     slurm-slurmdbd \
     slurm-perlapi \
     slurm-devel || {
-      log_warn "Some Slurm RPMs failed to install from enabled repositories."
-      log_warn "Check EPEL/PowerTools/CRB availability on Rocky 8.10."
+      log_warn "Some Slurm RPMs failed to install. Check EPEL/PowerTools/CRB."
     }
 
-  if ! command -v slurmd >/dev/null 2>&1; then
-    log_error "slurmd not found after package install. Slurm packages are missing."
+  command -v slurmd >/dev/null 2>&1 || {
+    log_error "slurmd not found. Slurm packages missing."
     return 1
-  fi
+  }
 
-  if ! command -v munged >/dev/null 2>&1; then
-    log_error "munged not found after package install. Munge package is missing."
+  command -v munged >/dev/null 2>&1 || {
+    log_error "munged not found. Munge package missing."
     return 1
-  fi
+  }
 
-  log_ok "Slurm/Munge/MariaDB/environment-modules package installation completed."
+  log_ok "Package installation completed."
 }
 
 # ------------------------------------------------------------------------------
-# Users, Groups, Directories, ACLs
+# Users / groups / dirs / ACLs
 # ------------------------------------------------------------------------------
 
 slurm_create_users_groups_dirs() {
-  log_section "Creating Slurm Users, HPC Group, Directories and ACLs"
+  log_section "Creating Users, HPC Group, Directories and ACLs"
 
-  if ! getent group "${HPC_GROUP}" >/dev/null 2>&1; then
-    groupadd "${HPC_GROUP}"
-    log_ok "Created group: ${HPC_GROUP}"
-  else
-    log_ok "Group exists: ${HPC_GROUP}"
-  fi
+  getent group "${HPC_GROUP}" >/dev/null 2>&1 || groupadd "${HPC_GROUP}"
 
   if ! id "${SLURM_USER}" >/dev/null 2>&1; then
     useradd --system --home /var/lib/slurm --shell /sbin/nologin "${SLURM_USER}" || true
-    log_ok "Created user: ${SLURM_USER}"
-  else
-    log_ok "User exists: ${SLURM_USER}"
   fi
 
   if ! id "${RUN_USER}" >/dev/null 2>&1; then
-    log_warn "Run user ${RUN_USER} does not exist. Creating user."
+    log_warn "Run user ${RUN_USER} missing. Creating user."
     useradd -m -s /bin/bash "${RUN_USER}"
     passwd "${RUN_USER}"
-    log_ok "Created run user: ${RUN_USER}"
-  else
-    log_ok "Run user exists: ${RUN_USER}"
   fi
 
   usermod -aG "${HPC_GROUP}" "${RUN_USER}" || true
@@ -314,43 +259,28 @@ slurm_create_users_groups_dirs() {
     "${SHARED_DATA_PATH}" \
     "${SHARED_SCRATCH_PATH}"
 
-  chown -R "${SLURM_USER}:${HPC_GROUP}" /var/lib/slurm
-  chown -R "${SLURM_USER}:${HPC_GROUP}" /var/spool/slurmctld
-  chown -R "${SLURM_USER}:${HPC_GROUP}" /var/spool/slurmd
-  chown -R "${SLURM_USER}:${HPC_GROUP}" /var/log/slurm
-  chown -R "${SLURM_USER}:${HPC_GROUP}" /etc/slurm
-
-  chmod 775 /var/lib/slurm
-  chmod 775 /var/spool/slurmctld
-  chmod 775 /var/spool/slurmd
-  chmod 775 /var/log/slurm
+  chown -R "${SLURM_USER}:${HPC_GROUP}" /etc/slurm /var/lib/slurm /var/spool/slurmctld /var/spool/slurmd /var/log/slurm
   chmod 755 /etc/slurm
+  chmod 775 /var/lib/slurm /var/spool/slurmctld /var/spool/slurmd /var/log/slurm
 
-  chown -R root:"${HPC_GROUP}" "${SHARED_APP_PATH}"
-  chown -R root:"${HPC_GROUP}" "${MODULEFILES_PATH}"
-  chown -R "${RUN_USER}:${HPC_GROUP}" "${SHARED_DATA_PATH}"
-  chown -R "${RUN_USER}:${HPC_GROUP}" "${SHARED_SCRATCH_PATH}"
+  chown -R root:"${HPC_GROUP}" "${SHARED_APP_PATH}" "${MODULEFILES_PATH}"
+  chown -R "${RUN_USER}:${HPC_GROUP}" "${SHARED_DATA_PATH}" "${SHARED_SCRATCH_PATH}"
 
-  chmod 2775 "${SHARED_APP_PATH}"
-  chmod 2775 "${MODULEFILES_PATH}"
-  chmod 2775 "${SHARED_DATA_PATH}"
+  chmod 2775 "${SHARED_APP_PATH}" "${MODULEFILES_PATH}" "${SHARED_DATA_PATH}"
   chmod 2777 "${SHARED_SCRATCH_PATH}"
 
   if command -v setfacl >/dev/null 2>&1; then
     setfacl -R -m g:"${HPC_GROUP}":rwx "${SHARED_APP_PATH}" "${MODULEFILES_PATH}" "${SHARED_DATA_PATH}" "${SHARED_SCRATCH_PATH}" || true
     setfacl -R -d -m g:"${HPC_GROUP}":rwx "${SHARED_APP_PATH}" "${MODULEFILES_PATH}" "${SHARED_DATA_PATH}" "${SHARED_SCRATCH_PATH}" || true
-
     setfacl -R -m u:"${RUN_USER}":rwx /var/log/slurm /var/spool/slurmd || true
     setfacl -R -m u:"${SLURM_USER}":rwx /var/log/slurm /var/spool/slurmd /var/spool/slurmctld || true
-  else
-    log_warn "setfacl not found. ACL inheritance skipped."
   fi
 
-  log_ok "Users, group access, directory permissions and ACLs configured."
+  log_ok "Users, groups, directories and ACLs configured."
 }
 
 # ------------------------------------------------------------------------------
-# Future HPC User Helper
+# Future user helper
 # ------------------------------------------------------------------------------
 
 slurm_install_hpc_user_helper() {
@@ -378,9 +308,7 @@ fi
 
 NEW_USER="\$1"
 
-if ! getent group "\${HPC_GROUP}" >/dev/null 2>&1; then
-  groupadd "\${HPC_GROUP}"
-fi
+getent group "\${HPC_GROUP}" >/dev/null 2>&1 || groupadd "\${HPC_GROUP}"
 
 if ! id "\${NEW_USER}" >/dev/null 2>&1; then
   useradd -m -s /bin/bash "\${NEW_USER}"
@@ -417,23 +345,17 @@ fi
 PROFILEEOF
 
 echo "User \${NEW_USER} is ready for HPC/Slurm jobs."
-echo "Ask user to logout/login once to inherit group membership."
-echo "Validation:"
-echo "  id \${NEW_USER}"
-echo "  sudo -u \${NEW_USER} touch ${SHARED_SCRATCH_PATH}/\${NEW_USER}-test.txt"
-echo "  sudo -u \${NEW_USER} sbatch /opt/slurm-tests/cpu-test.sbatch"
+echo "Ask user to logout/login once to inherit hpc group membership."
 EOF
 
   chmod 755 /usr/local/sbin/capac-add-hpc-user
   chown root:root /usr/local/sbin/capac-add-hpc-user
 
-  log_ok "Installed helper: /usr/local/sbin/capac-add-hpc-user"
-  log_info "Future user command:"
-  log_info "  sudo capac-add-hpc-user <username>"
+  log_ok "Installed: /usr/local/sbin/capac-add-hpc-user"
 }
 
 # ------------------------------------------------------------------------------
-# Munge - hardened
+# Munge
 # ------------------------------------------------------------------------------
 
 slurm_configure_munge() {
@@ -450,17 +372,13 @@ slurm_configure_munge() {
 
   if [[ "${NODE_ROLE}" == "master" ]]; then
     if [[ ! -s /etc/munge/munge.key ]]; then
-      log_info "Generating Munge key on master using /dev/urandom."
+      log_info "Generating Munge key using /dev/urandom."
       dd if=/dev/urandom of=/etc/munge/munge.key bs=1024 count=1 status=none
-      log_ok "Munge key generated."
     else
-      log_ok "Munge key already exists on master."
+      log_ok "Munge key already exists."
     fi
   else
-    if [[ ! -s /etc/munge/munge.key ]]; then
-      log_warn "Munge key missing on compute node."
-      log_warn "It must be copied from ${MASTER_HOST}:/etc/munge/munge.key"
-    fi
+    [[ -s /etc/munge/munge.key ]] || log_warn "Munge key missing on compute node."
   fi
 
   chown -R munge:munge /etc/munge /var/lib/munge /var/log/munge /run/munge || true
@@ -485,26 +403,26 @@ slurm_configure_munge() {
   fi
 
   if ! munge -n | unmunge >/dev/null 2>&1; then
-    log_error "Munge socket/authentication test failed."
+    log_error "Munge validation failed."
     systemctl status munge --no-pager -l || true
     journalctl -u munge -n 80 --no-pager || true
     return 1
   fi
 
-  log_ok "Munge configured, started, and validated."
+  log_ok "Munge configured and validated."
 }
 
 # ------------------------------------------------------------------------------
-# MariaDB Accounting
+# MariaDB accounting
 # ------------------------------------------------------------------------------
 
 slurm_configure_mariadb_if_master() {
-  if [[ "${NODE_ROLE}" != "master" ]]; then
-    log_info "Skipping MariaDB accounting setup on compute node."
+  [[ "${NODE_ROLE}" == "master" ]] || {
+    log_info "Skipping MariaDB on compute node."
     return 0
-  fi
+  }
 
-  log_section "Configuring MariaDB for Slurm Accounting"
+  log_section "Configuring MariaDB Slurm Accounting"
 
   systemctl enable --now mariadb
 
@@ -520,8 +438,9 @@ EOF
 
   systemctl restart mariadb
 
+  mkdir -p /etc/slurm
+
   if [[ ! -f "${SLURM_DB_PASS_FILE}" ]]; then
-    mkdir -p /etc/slurm
     openssl rand -base64 24 > "${SLURM_DB_PASS_FILE}"
     chmod 600 "${SLURM_DB_PASS_FILE}"
   fi
@@ -535,11 +454,11 @@ GRANT ALL PRIVILEGES ON ${SLURM_DB_NAME}.* TO '${SLURM_DB_USER}'@'localhost';
 FLUSH PRIVILEGES;
 EOF
 
-  log_ok "MariaDB Slurm accounting database configured."
+  log_ok "MariaDB accounting configured."
 }
 
 # ------------------------------------------------------------------------------
-# Slurm Configs
+# Slurm config
 # ------------------------------------------------------------------------------
 
 slurm_write_configs() {
@@ -554,10 +473,6 @@ slurm_write_configs() {
   [[ -f "${slurmdbd_conf}" ]] && cp -a "${slurmdbd_conf}" "${slurmdbd_conf}.bak.$(date +%Y%m%d%H%M%S)"
 
   cat > "${slurm_conf}" <<EOF
-# ==============================================================================
-# CAPAC Slurm Configuration
-# ==============================================================================
-
 ClusterName=${CLUSTER_NAME}
 SlurmctldHost=${MASTER_HOST}(${MASTER_IP})
 
@@ -612,10 +527,6 @@ PartitionName=${PARTITION_NAME} Nodes=${MASTER_HOST},${COMPUTE_HOST} Default=YES
 EOF
 
   cat > "${cgroup_conf}" <<'EOF'
-# ==============================================================================
-# CAPAC Slurm Cgroup Configuration
-# ==============================================================================
-
 CgroupAutomount=yes
 ConstrainCores=yes
 ConstrainDevices=yes
@@ -632,10 +543,6 @@ EOF
     SLURM_DB_PASS="$(cat "${SLURM_DB_PASS_FILE}")"
 
     cat > "${slurmdbd_conf}" <<EOF
-# ==============================================================================
-# CAPAC SlurmDBD Configuration
-# ==============================================================================
-
 AuthType=auth/munge
 DbdHost=${MASTER_HOST}
 DbdPort=6819
@@ -659,7 +566,7 @@ EOF
   chmod 644 "${slurm_conf}" "${cgroup_conf}"
   chown -R "${SLURM_USER}:${HPC_GROUP}" /etc/slurm /var/log/slurm /var/spool/slurmctld /var/spool/slurmd
 
-  log_ok "Slurm configuration written."
+  log_ok "Slurm configs written."
 }
 
 # ------------------------------------------------------------------------------
@@ -669,13 +576,9 @@ EOF
 slurm_configure_environment_modules() {
   log_section "Configuring Environment Modules"
 
-  mkdir -p "${MODULEFILES_PATH}"
-  chmod 2775 "${MODULEFILES_PATH}"
-  chown -R root:"${HPC_GROUP}" "${MODULEFILES_PATH}"
+  mkdir -p "${MODULEFILES_PATH}/openmpi" "${MODULEFILES_PATH}/intel-mpi"
 
   cat > /etc/profile.d/capac-modules.sh <<EOF
-# CAPAC Environment Modules path
-
 if [[ -f /etc/profile.d/modules.sh ]]; then
   source /etc/profile.d/modules.sh
 fi
@@ -685,33 +588,28 @@ if command -v module >/dev/null 2>&1; then
 fi
 EOF
 
-  mkdir -p "${MODULEFILES_PATH}/openmpi"
-
   cat > "${MODULEFILES_PATH}/openmpi/rocky8" <<'EOF'
 #%Module1.0#####################################################################
-
 proc ModulesHelp { } {
     puts stderr "Loads OpenMPI from Rocky/EPEL packages."
 }
-
 module-whatis "OpenMPI for CAPAC Rocky 8 CAE/HPC cluster"
-
 prepend-path PATH /usr/lib64/openmpi/bin
 prepend-path LD_LIBRARY_PATH /usr/lib64/openmpi/lib
 prepend-path MANPATH /usr/share/man
-
 setenv MPI_HOME /usr/lib64/openmpi
 setenv OMPI_MCA_btl self,vader,tcp
 EOF
 
   chown -R root:"${HPC_GROUP}" "${MODULEFILES_PATH}"
   chmod -R g+rwX "${MODULEFILES_PATH}"
+  chmod 2775 "${MODULEFILES_PATH}"
 
   log_ok "Environment Modules configured."
 }
 
 # ------------------------------------------------------------------------------
-# Intel MPI Modulefile
+# Intel MPI module
 # ------------------------------------------------------------------------------
 
 slurm_configure_intel_mpi_module() {
@@ -726,7 +624,7 @@ slurm_configure_intel_mpi_module() {
   fi
 
   if [[ "${INSTALL_INTEL_MPI}" == "yes" ]]; then
-    rpm --import https://yum.repos.intel.com/oneapi/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB || true
+    log_info "Adding Intel oneAPI repo."
 
     cat > /etc/yum.repos.d/intel-oneapi.repo <<'EOF'
 [oneAPI]
@@ -734,35 +632,37 @@ name=Intel oneAPI repository
 baseurl=https://yum.repos.intel.com/oneapi
 enabled=1
 gpgcheck=1
-repo_gpgcheck=0
-gpgkey=https://yum.repos.intel.com/oneapi/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+repo_gpgcheck=1
+gpgkey=https://yum.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
 EOF
 
-    dnf makecache -y || true
-    dnf install -y intel-oneapi-mpi intel-oneapi-mpi-devel || true
+    dnf makecache --disablerepo="*" --enablerepo="oneAPI" -y || {
+      log_warn "Intel oneAPI repo refresh failed. Skipping Intel MPI install."
+      INSTALL_INTEL_MPI="no"
+    }
+
+    if [[ "${INSTALL_INTEL_MPI}" == "yes" ]]; then
+      dnf install -y intel-oneapi-mpi intel-oneapi-mpi-devel || {
+        log_warn "Intel MPI install failed. Continuing with modulefile only."
+      }
+    fi
   fi
 
   mkdir -p "${MODULEFILES_PATH}/intel-mpi"
 
   cat > "${MODULEFILES_PATH}/intel-mpi/oneapi" <<EOF
 #%Module1.0#####################################################################
-
 proc ModulesHelp { } {
     puts stderr "Loads Intel MPI from Intel oneAPI if installed under ${INTEL_ONEAPI_ROOT}."
 }
-
 module-whatis "Intel MPI from oneAPI"
-
 set mpi_root ${INTEL_ONEAPI_ROOT}/mpi/latest
-
 if { ! [file isdirectory \$mpi_root] } {
     puts stderr "WARNING: Intel MPI not found at \$mpi_root"
 }
-
 prepend-path PATH \$mpi_root/bin
 prepend-path LD_LIBRARY_PATH \$mpi_root/lib
 prepend-path MANPATH \$mpi_root/share/man
-
 setenv I_MPI_ROOT \$mpi_root
 setenv MPI_HOME \$mpi_root
 setenv I_MPI_FABRICS shm:tcp
@@ -773,52 +673,44 @@ EOF
   chown -R root:"${HPC_GROUP}" "${MODULEFILES_PATH}/intel-mpi"
   chmod -R g+rwX "${MODULEFILES_PATH}/intel-mpi"
 
-  log_ok "Intel MPI modulefile created."
+  log_ok "Intel MPI modulefile configured."
 }
 
 # ------------------------------------------------------------------------------
-# Root SSH Setup and Sync
+# Root SSH and sync
 # ------------------------------------------------------------------------------
 
 slurm_setup_root_ssh_if_master() {
-  if [[ "${NODE_ROLE}" != "master" ]]; then
-    return 0
-  fi
+  [[ "${NODE_ROLE}" == "master" ]] || return 0
 
-  log_section "Checking Root SSH from Master to Compute"
+  log_section "Checking Root SSH to Compute"
 
   mkdir -p /root/.ssh
   chmod 700 /root/.ssh
 
   if [[ ! -f /root/.ssh/id_ed25519 ]]; then
     ssh-keygen -t ed25519 -N "" -f /root/.ssh/id_ed25519
-    log_ok "Root SSH key generated."
   fi
 
   if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@"${COMPUTE_HOST}" "hostname -s" >/dev/null 2>&1; then
-    log_ok "Passwordless root SSH to ${COMPUTE_HOST} works."
+    log_ok "Passwordless root SSH works."
     return 0
   fi
 
-  log_warn "Passwordless root SSH to ${COMPUTE_HOST} is not working."
+  log_warn "Passwordless root SSH not ready."
 
-  if slurm_confirm "Setup root SSH key copy to ${COMPUTE_HOST} now? [y/N]: "; then
+  if slurm_confirm "Setup root SSH key copy to ${COMPUTE_HOST}? [y/N]: "; then
     ssh-copy-id -o StrictHostKeyChecking=no root@"${COMPUTE_HOST}" || true
   fi
 }
 
 slurm_sync_to_compute_if_master() {
-  if [[ "${NODE_ROLE}" != "master" ]]; then
-    return 0
-  fi
+  [[ "${NODE_ROLE}" == "master" ]] || return 0
 
-  log_section "Syncing Slurm, Munge, Modules and Access Configs to Compute Node"
+  log_section "Syncing Slurm/Munge/Modules to Compute"
 
   if ! ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@"${COMPUTE_HOST}" "hostname -s" >/dev/null 2>&1; then
-    log_warn "Skipping automatic sync because root SSH is not ready."
-    log_warn "Manual sync required:"
-    log_warn "  scp /etc/munge/munge.key root@${COMPUTE_HOST}:/etc/munge/munge.key"
-    log_warn "  rsync -av /etc/slurm/ root@${COMPUTE_HOST}:/etc/slurm/"
+    log_warn "Skipping sync. Root SSH not ready."
     return 0
   fi
 
@@ -859,15 +751,16 @@ slurm_sync_to_compute_if_master() {
     fi
 
     chmod 755 /usr/local/sbin/capac-add-hpc-user || true
+    systemctl enable munge slurmd || true
     systemctl restart munge || true
     systemctl restart slurmd || true
   "
 
-  log_ok "Configs synced to compute node."
+  log_ok "Compute node synced."
 }
 
 # ------------------------------------------------------------------------------
-# Services
+# Services and boot persistence
 # ------------------------------------------------------------------------------
 
 slurm_enable_services() {
@@ -879,7 +772,7 @@ slurm_enable_services() {
   sleep 2
 
   if ! munge -n | unmunge >/dev/null 2>&1; then
-    log_error "Munge validation failed. Not starting Slurm services."
+    log_error "Munge validation failed. Not starting Slurm."
     systemctl status munge --no-pager -l || true
     journalctl -u munge -n 80 --no-pager || true
     return 1
@@ -890,11 +783,10 @@ slurm_enable_services() {
 
     systemctl enable slurmdbd
     systemctl restart slurmdbd
-
     sleep 3
 
     if ! systemctl is-active slurmdbd >/dev/null 2>&1; then
-      log_error "slurmdbd failed to start."
+      log_error "slurmdbd failed."
       systemctl status slurmdbd --no-pager -l || true
       journalctl -u slurmdbd -n 80 --no-pager || true
       return 1
@@ -902,11 +794,10 @@ slurm_enable_services() {
 
     systemctl enable slurmctld
     systemctl restart slurmctld
-
     sleep 3
 
     if ! systemctl is-active slurmctld >/dev/null 2>&1; then
-      log_error "slurmctld failed to start."
+      log_error "slurmctld failed."
       systemctl status slurmctld --no-pager -l || true
       journalctl -u slurmctld -n 80 --no-pager || true
       return 1
@@ -915,34 +806,64 @@ slurm_enable_services() {
 
   systemctl enable slurmd
   systemctl restart slurmd
-
   sleep 2
 
   if ! systemctl is-active slurmd >/dev/null 2>&1; then
-    log_error "slurmd failed to start."
+    log_error "slurmd failed."
     systemctl status slurmd --no-pager -l || true
     journalctl -u slurmd -n 80 --no-pager || true
     return 1
   fi
 
-  log_ok "Slurm services enabled/restarted."
+  log_ok "Slurm services enabled and active."
+}
+
+slurm_enable_boot_persistence() {
+  log_section "Enabling Reboot Persistence"
+
+  systemctl daemon-reload
+  systemctl enable munge
+
+  if [[ "${NODE_ROLE}" == "master" ]]; then
+    systemctl enable mariadb
+    systemctl enable slurmdbd
+    systemctl enable slurmctld
+  fi
+
+  systemctl enable slurmd
+
+  cat > /etc/systemd/system/slurm-recover.service <<'EOF'
+[Unit]
+Description=CAPAC Slurm Recovery After Boot
+After=network-online.target munge.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash -lc 'systemctl restart munge; sleep 2; systemctl restart slurmd; if systemctl list-unit-files slurmctld.service >/dev/null 2>&1; then systemctl restart slurmdbd || true; sleep 2; systemctl restart slurmctld || true; fi'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable slurm-recover.service
+
+  log_ok "Boot persistence enabled."
 }
 
 # ------------------------------------------------------------------------------
-# Accounting Registration
+# Accounting / tests / summary
 # ------------------------------------------------------------------------------
 
 slurm_register_accounting_if_master() {
-  if [[ "${NODE_ROLE}" != "master" ]]; then
-    return 0
-  fi
+  [[ "${NODE_ROLE}" == "master" ]] || return 0
 
   log_section "Registering Slurm Accounting Cluster"
 
-  sleep 3
-
   if ! munge -n | unmunge >/dev/null 2>&1; then
-    log_error "Munge is not healthy. Skipping sacctmgr registration."
+    log_error "Munge unhealthy. Skipping accounting registration."
     return 1
   fi
 
@@ -954,14 +875,8 @@ slurm_register_accounting_if_master() {
   fi
 }
 
-# ------------------------------------------------------------------------------
-# Test Jobs
-# ------------------------------------------------------------------------------
-
 slurm_create_test_jobs_if_master() {
-  if [[ "${NODE_ROLE}" != "master" ]]; then
-    return 0
-  fi
+  [[ "${NODE_ROLE}" == "master" ]] || return 0
 
   log_section "Creating Slurm Test Jobs"
 
@@ -993,9 +908,7 @@ EOF
 
 echo "Job ID: \${SLURM_JOB_ID}"
 echo "Node: \$(hostname)"
-echo "CPU layout:"
 lscpu | egrep 'CPU\\(s\\)|Thread|Core|Socket|NUMA'
-echo "Running simple parallel hostname test:"
 srun bash -c 'echo rank=\${SLURM_PROCID} host=\$(hostname)'
 EOF
 
@@ -1003,20 +916,16 @@ EOF
   chown -R root:"${HPC_GROUP}" /opt/slurm-tests
   chmod -R 775 /opt/slurm-tests
 
-  log_ok "Test jobs created in /opt/slurm-tests"
+  log_ok "Test jobs created."
 }
-
-# ------------------------------------------------------------------------------
-# Summary
-# ------------------------------------------------------------------------------
 
 slurm_summary() {
   log_section "Slurm Cluster Summary"
 
-  log_info "Role       : ${NODE_ROLE}"
-  log_info "Cluster    : ${CLUSTER_NAME}"
-  log_info "Partition  : ${PARTITION_NAME}"
-  log_info "Nodes      : ${MASTER_HOST}, ${COMPUTE_HOST}"
+  log_info "Role      : ${NODE_ROLE}"
+  log_info "Cluster   : ${CLUSTER_NAME}"
+  log_info "Partition : ${PARTITION_NAME}"
+  log_info "Nodes     : ${MASTER_HOST}, ${COMPUTE_HOST}"
 
   log_info "Munge:"
   systemctl is-active munge | tee -a "${LOG_FILE}" || true
@@ -1028,16 +937,9 @@ slurm_summary() {
   systemctl is-active slurmd 2>/dev/null | tee -a "${LOG_FILE}" || true
 
   if [[ "${NODE_ROLE}" == "master" ]]; then
-    log_info "Slurm controller ping:"
     scontrol ping | tee -a "${LOG_FILE}" || true
-
-    log_info "Slurm nodes:"
     sinfo -Nel | tee -a "${LOG_FILE}" || true
-
-    log_info "Slurm partition:"
     sinfo | tee -a "${LOG_FILE}" || true
-
-    log_info "Accounting:"
     sacctmgr show cluster -P | tee -a "${LOG_FILE}" || true
   fi
 
@@ -1046,7 +948,6 @@ slurm_summary() {
     # shellcheck source=/dev/null
     source /etc/profile.d/modules.sh
   fi
-
   command -v module | tee -a "${LOG_FILE}" || true
   find "${MODULEFILES_PATH}" -maxdepth 3 -type f | tee -a "${LOG_FILE}" || true
 
@@ -1064,17 +965,8 @@ slurm_summary() {
     /var/spool/slurmd \
     /var/spool/slurmctld 2>/dev/null | tee -a "${LOG_FILE}" || true
 
-  log_info "Future user onboarding:"
+  log_info "Future user:"
   log_info "  sudo capac-add-hpc-user <username>"
-
-  log_info "Validation:"
-  log_info "  source /etc/profile.d/modules.sh"
-  log_info "  module use ${MODULEFILES_PATH}"
-  log_info "  module avail"
-  log_info "  module load openmpi/rocky8"
-  log_info "  scontrol ping"
-  log_info "  sinfo -Nel"
-  log_info "  sudo -u ${RUN_USER} sbatch /opt/slurm-tests/cpu-test.sbatch"
 
   log_ok "Slurm summary completed."
 }
