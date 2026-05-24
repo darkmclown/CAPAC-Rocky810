@@ -8,13 +8,12 @@ set -Eeuo pipefail
 # Purpose:
 #   Configure GUI/VNC/X11 environment for CAE and ANSYS applications.
 #
-# Behavior:
-#   - Asks for VNC Linux user once
-#   - Creates user if missing
-#   - Asks for Linux password only when needed
-#   - Asks for VNC password only when needed
-#   - Remembers safe VNC settings in /etc/capac-bootstrap/vnc.conf
-#   - Does NOT store plaintext passwords
+# Fixes:
+#   - Avoids systemd stuck in "activating"
+#   - Uses direct Xvnc foreground service with Type=simple
+#   - Starts XFCE after Xvnc comes up
+#   - Remembers safe settings only
+#   - Does not store plaintext passwords
 #
 # Required function:
 #   vnc_main()
@@ -28,6 +27,7 @@ vnc_main() {
   vnc_validate_user
   vnc_prepare_user_config
   vnc_create_xstartup
+  vnc_create_startxfce_script
   vnc_create_systemd_service
   vnc_enable_service
   vnc_save_settings
@@ -43,8 +43,6 @@ vnc_main() {
 vnc_install_packages() {
   log_section "Installing VNC, XFCE, and X11 Packages"
 
-  log_info "Installing XFCE desktop group if available..."
-
   dnf groupinstall -y "Xfce" || \
   dnf groupinstall -y "Xfce Desktop" || {
     log_warn "XFCE group not available. Installing individual XFCE packages."
@@ -59,8 +57,6 @@ vnc_install_packages() {
       tumbler \
       mousepad || true
   }
-
-  log_info "Installing TigerVNC, X11 forwarding, fonts, and OpenGL packages..."
 
   dnf install -y \
     tigervnc-server \
@@ -115,13 +111,8 @@ vnc_read_secret_tty() {
   local prompt="$1"
   local var_name="$2"
 
-  if [[ -r /dev/tty ]]; then
-    read -rsp "${prompt}" "${var_name}" < /dev/tty
-    echo > /dev/tty
-  else
-    log_error "No interactive terminal available for password input."
-    return 1
-  fi
+  read -rsp "${prompt}" "${var_name}" < /dev/tty
+  echo > /dev/tty
 }
 
 vnc_confirm() {
@@ -313,6 +304,10 @@ vnc_prepare_user_config() {
     vnc_set_password
   fi
 
+  touch "${VNC_HOME}/.Xauthority"
+  chown "${VNC_USER}:${VNC_GROUP}" "${VNC_HOME}/.Xauthority"
+  chmod 600 "${VNC_HOME}/.Xauthority"
+
   chown -R "${VNC_USER}:${VNC_GROUP}" "${VNC_HOME}/.vnc"
   chmod 700 "${VNC_HOME}/.vnc"
   chmod 600 "${VNC_HOME}/.vnc/passwd" 2>/dev/null || true
@@ -323,11 +318,6 @@ vnc_prepare_user_config() {
 vnc_set_password() {
   local vnc_password_1
   local vnc_password_2
-  local use_same_answer
-
-  if vnc_confirm "Use same password as Linux login? [y/N]: "; then
-    log_warn "For security, the script will ask you to type it again."
-  fi
 
   vnc_read_secret_tty "Enter VNC password for ${VNC_USER}: " vnc_password_1
   vnc_read_secret_tty "Confirm VNC password for ${VNC_USER}: " vnc_password_2
@@ -342,7 +332,7 @@ vnc_set_password() {
   chown "${VNC_USER}:${VNC_GROUP}" "${VNC_HOME}/.vnc/passwd"
   chmod 600 "${VNC_HOME}/.vnc/passwd"
 
-  unset vnc_password_1 vnc_password_2 use_same_answer
+  unset vnc_password_1 vnc_password_2
 
   log_ok "VNC password configured for user: ${VNC_USER}"
 }
@@ -371,6 +361,10 @@ export XDG_SESSION_TYPE=x11
 export DESKTOP_SESSION=xfce
 export XDG_CURRENT_DESKTOP=XFCE
 
+# Reduce noise in virtual VNC sessions.
+xfce4-screensaver --quit >/dev/null 2>&1 || true
+xfce4-power-manager --quit >/dev/null 2>&1 || true
+
 if command -v dbus-launch >/dev/null 2>&1; then
   exec dbus-launch --exit-with-session startxfce4
 else
@@ -385,6 +379,45 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
+# XFCE Start Helper
+# ------------------------------------------------------------------------------
+
+vnc_create_startxfce_script() {
+  log_section "Creating XFCE Start Helper"
+
+  local helper="/usr/local/bin/capac-vnc-startxfce-${VNC_DISPLAY}.sh"
+
+  cat > "${helper}" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export DISPLAY=:${VNC_DISPLAY}
+export HOME="${VNC_HOME}"
+export USER="${VNC_USER}"
+export LOGNAME="${VNC_USER}"
+
+cd "${VNC_HOME}"
+
+# Wait briefly for Xvnc to become ready.
+for i in {1..20}; do
+  if xdpyinfo -display ":${VNC_DISPLAY}" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.5
+done
+
+nohup "${VNC_HOME}/.vnc/xstartup" > "${VNC_HOME}/.vnc/xfce-session-${VNC_DISPLAY}.log" 2>&1 &
+EOF
+
+  chmod 755 "${helper}"
+  chown root:root "${helper}"
+
+  VNC_XFCE_HELPER="${helper}"
+
+  log_ok "Created XFCE helper: ${helper}"
+}
+
+# ------------------------------------------------------------------------------
 # systemd Service
 # ------------------------------------------------------------------------------
 
@@ -392,6 +425,18 @@ vnc_create_systemd_service() {
   log_section "Creating systemd VNC Service"
 
   local service_file="/etc/systemd/system/vncserver@.service"
+  local localhost_flag="-localhost"
+
+  if [[ "${VNC_LOCALHOST}" == "yes" ]]; then
+    localhost_flag="-localhost"
+  else
+    localhost_flag="-nolisten tcp"
+  fi
+
+  # Stop old service/session safely before replacing service.
+  systemctl stop "vncserver@${VNC_DISPLAY}.service" >/dev/null 2>&1 || true
+  pkill -u "${VNC_USER}" -f "Xvnc :${VNC_DISPLAY}" >/dev/null 2>&1 || true
+  su - "${VNC_USER}" -c "vncserver -kill :${VNC_DISPLAY}" >/dev/null 2>&1 || true
 
   if [[ -f "${service_file}" ]]; then
     cp -a "${service_file}" "${service_file}.bak.$(date +%Y%m%d%H%M%S)"
@@ -400,23 +445,26 @@ vnc_create_systemd_service() {
 
   cat > "${service_file}" <<EOF
 [Unit]
-Description=TigerVNC Server for display :%i
+Description=CAPAC TigerVNC Server for display :%i
 After=network.target
 
 [Service]
-Type=forking
+Type=simple
 User=${VNC_USER}
 Group=${VNC_GROUP}
 WorkingDirectory=${VNC_HOME}
 
-PIDFile=${VNC_HOME}/.vnc/%H:%i.pid
+Environment=HOME=${VNC_HOME}
+Environment=USER=${VNC_USER}
+Environment=LOGNAME=${VNC_USER}
 
-ExecStartPre=/bin/sh -c '/usr/bin/vncserver -kill :%i > /dev/null 2>&1 || true'
-ExecStart=/usr/bin/vncserver :%i -geometry ${VNC_GEOMETRY} -depth ${VNC_DEPTH} -localhost ${VNC_LOCALHOST}
-ExecStop=/usr/bin/vncserver -kill :%i
+ExecStartPre=/bin/sh -c '/usr/bin/vncserver -kill :%i >/dev/null 2>&1 || true'
+ExecStart=/usr/bin/Xvnc :%i -geometry ${VNC_GEOMETRY} -depth ${VNC_DEPTH} ${localhost_flag} -SecurityTypes VncAuth -PasswordFile ${VNC_HOME}/.vnc/passwd -auth ${VNC_HOME}/.Xauthority
+ExecStartPost=/bin/sh -c '/usr/local/bin/capac-vnc-startxfce-%i.sh'
+ExecStop=/bin/sh -c '/usr/bin/vncserver -kill :%i >/dev/null 2>&1 || pkill -u ${VNC_USER} -f "Xvnc :%i" || true'
 
 Restart=on-failure
-RestartSec=10
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -424,7 +472,7 @@ EOF
 
   systemctl daemon-reload
 
-  log_ok "Created systemd service template: ${service_file}"
+  log_ok "Created fixed systemd service template: ${service_file}"
 }
 
 # ------------------------------------------------------------------------------
@@ -438,9 +486,10 @@ vnc_enable_service() {
 
   systemctl enable "${service_name}"
 
-  if vnc_confirm "Start VNC service now on display :${VNC_DISPLAY}? [y/N]: "; then
+  if vnc_confirm "Start/restart VNC service now on display :${VNC_DISPLAY}? [Y/n]: "; then
     systemctl restart "${service_name}"
-    log_ok "VNC service started: ${service_name}"
+    sleep 3
+    log_ok "VNC service restart requested: ${service_name}"
   else
     log_warn "VNC service enabled but not started."
     log_info "Start later with: sudo systemctl start ${service_name}"
@@ -472,7 +521,7 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# Summary
+# Summary / Health Check
 # ------------------------------------------------------------------------------
 
 vnc_summary() {
@@ -489,46 +538,31 @@ vnc_summary() {
   log_info "VNC xstartup  : ${VNC_HOME}/.vnc/xstartup"
   log_info "Saved config  : ${VNC_CONFIG_FILE}"
 
-  log_info "Check service:"
-  log_info "  sudo systemctl status ${service_name} --no-pager"
+  echo ""
+  echo "=== VNC HEALTH CHECK ===" | tee -a "${LOG_FILE}"
 
-  log_info "Start service:"
-  log_info "  sudo systemctl start ${service_name}"
+  systemctl is-enabled "${service_name}" 2>/dev/null | tee -a "${LOG_FILE}" || true
+  systemctl is-active "${service_name}" 2>/dev/null | tee -a "${LOG_FILE}" || true
 
-  log_info "Stop service:"
-  log_info "  sudo systemctl stop ${service_name}"
+  ss -ltnp | grep ":${vnc_port}" | tee -a "${LOG_FILE}" || log_warn "VNC port ${vnc_port} not listening."
+  pgrep -a Xvnc | tee -a "${LOG_FILE}" || log_warn "Xvnc not running."
+  pgrep -a xfce4-session | tee -a "${LOG_FILE}" || log_warn "XFCE session not running."
+
+  if timeout 3 bash -c "</dev/tcp/127.0.0.1/${vnc_port}" 2>/dev/null; then
+    log_ok "VNC is locally reachable on 127.0.0.1:${vnc_port}"
+  else
+    log_warn "VNC is not locally reachable on 127.0.0.1:${vnc_port}"
+  fi
 
   if [[ "${VNC_LOCALHOST}" == "yes" ]]; then
-    log_info "Secure SSH tunnel connection:"
+    log_info "Connect using SSH tunnel:"
     log_info "  ssh -L ${vnc_port}:localhost:${vnc_port} ${VNC_USER}@<server-ip>"
-    log_info "  Then connect VNC client to localhost:${vnc_port}"
+    log_info "  Then open VNC client to localhost:${vnc_port}"
   else
-    log_info "Direct VNC client connection:"
+    log_info "Connect directly:"
     log_info "  <server-ip>:${VNC_DISPLAY}"
-    log_info "  or port ${vnc_port}"
+    log_info "  or <server-ip>:${vnc_port}"
   fi
 
-  log_info "X11 forwarding test:"
-  log_info "  ssh -X ${VNC_USER}@<server-ip>"
-  log_info "  xclock"
-
-  if command -v startxfce4 >/dev/null 2>&1; then
-    log_ok "XFCE available: startxfce4"
-  else
-    log_warn "startxfce4 not found. XFCE may not be installed correctly."
-  fi
-
-  if command -v vncserver >/dev/null 2>&1; then
-    log_ok "TigerVNC available: vncserver"
-  else
-    log_warn "vncserver command not found."
-  fi
-
-  if command -v xauth >/dev/null 2>&1; then
-    log_ok "X11 forwarding helper available: xauth"
-  else
-    log_warn "xauth command not found."
-  fi
-
-  systemctl status "${service_name}" --no-pager || true
+  systemctl status "${service_name}" --no-pager -l | sed -n '1,25p' | tee -a "${LOG_FILE}" || true
 }
