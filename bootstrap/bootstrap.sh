@@ -6,13 +6,18 @@ set -Eeuo pipefail
 # File: bootstrap/bootstrap.sh
 #
 # Purpose:
-#   Master bootstrap controller.
-#   Automatically discovers modules from ../modules/*.sh
+#   Main bootstrap controller.
+#   - Discovers modules automatically from ../modules/*.sh
+#   - Skips common.sh
+#   - Supports automated mode
+#   - Supports manual module selection
+#   - Supports validation-only mode
+#   - Tracks state and failed module
 #
-# Modes:
-#   1. Automated bootstrap
-#   2. Manual module selection
-#   3. Validation only
+# CLI Modes:
+#   sudo bash bootstrap.sh --auto
+#   sudo bash bootstrap.sh --manual
+#   sudo bash bootstrap.sh --validate
 # ==============================================================================
 
 SCRIPT_NAME="$(basename "$0")"
@@ -20,10 +25,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MODULE_DIR="${ROOT_DIR}/modules"
 
-LOG_DIR="/var/log/capac-bootstrap"
-LOG_FILE="${LOG_DIR}/bootstrap.log"
+LOG_DIR="${LOG_DIR:-/var/log/capac-bootstrap}"
+LOG_FILE="${LOG_FILE:-${LOG_DIR}/bootstrap.log}"
 
-STATE_DIR="/var/lib/capac-bootstrap"
+STATE_DIR="${STATE_DIR:-/var/lib/capac-bootstrap}"
 STATE_FILE="${STATE_DIR}/bootstrap.state"
 FAILED_FILE="${STATE_DIR}/failed.module"
 
@@ -31,12 +36,20 @@ CLUSTER_NAME="${CLUSTER_NAME:-capac-hpc}"
 NODE_ROLE="${NODE_ROLE:-master}"
 TIMEZONE="${TIMEZONE:-Asia/Kolkata}"
 
-# Discovered modules will be loaded here.
 MODULES=()
 
 # ------------------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------------------
+
+prepare_directories() {
+  mkdir -p "${LOG_DIR}"
+  mkdir -p "${STATE_DIR}"
+  touch "${LOG_FILE}"
+  touch "${STATE_FILE}"
+  chmod 0644 "${LOG_FILE}"
+  chmod 0644 "${STATE_FILE}"
+}
 
 log() {
   echo -e "$*" | tee -a "${LOG_FILE}"
@@ -66,6 +79,23 @@ log_section() {
 }
 
 # ------------------------------------------------------------------------------
+# Safe Input
+# ------------------------------------------------------------------------------
+
+read_tty() {
+  local prompt="$1"
+  local var_name="$2"
+
+  if [[ -r /dev/tty ]]; then
+    read -rp "${prompt}" "${var_name}" < /dev/tty
+  else
+    log_error "No interactive terminal available."
+    log_error "Run bootstrap from an interactive shell."
+    exit 1
+  fi
+}
+
+# ------------------------------------------------------------------------------
 # Fail-safe
 # ------------------------------------------------------------------------------
 
@@ -84,7 +114,7 @@ fail_safe_exit() {
     echo "FAILED" > "${STATE_FILE}" || true
 
     log_warn "Fail-safe triggered. System state preserved."
-    log_warn "Last failed module, if any: ${FAILED_FILE}"
+    log_warn "Failed module marker: ${FAILED_FILE}"
     log_warn "Re-run after fixing the issue:"
     log_warn "  sudo bash ${SCRIPT_DIR}/bootstrap.sh"
   fi
@@ -93,7 +123,7 @@ fail_safe_exit() {
 trap fail_safe_exit EXIT
 
 # ------------------------------------------------------------------------------
-# Basic Checks
+# Base Checks
 # ------------------------------------------------------------------------------
 
 require_root() {
@@ -101,17 +131,6 @@ require_root() {
     echo "[ERROR] This script must be run as root or with sudo."
     exit 1
   fi
-}
-
-prepare_directories() {
-  mkdir -p "${LOG_DIR}"
-  mkdir -p "${STATE_DIR}"
-
-  touch "${LOG_FILE}"
-  touch "${STATE_FILE}"
-
-  chmod 0644 "${LOG_FILE}"
-  chmod 0644 "${STATE_FILE}"
 }
 
 validate_rocky() {
@@ -134,7 +153,9 @@ validate_rocky() {
     log_warn "Expected Rocky Linux 8.10."
     log_warn "Current system: ${os_release}"
 
-    read -rp "Continue anyway? [y/N]: " confirm
+    local confirm
+    read_tty "Continue anyway? [y/N]: " confirm
+
     case "${confirm}" in
       y|Y|yes|YES)
         log_warn "Continuing on non-validated Rocky version."
@@ -174,6 +195,23 @@ show_context() {
 }
 
 # ------------------------------------------------------------------------------
+# Shared Helper Loading
+# ------------------------------------------------------------------------------
+
+load_common_if_present() {
+  local common_file="${MODULE_DIR}/common.sh"
+
+  if [[ -f "${common_file}" ]]; then
+    log_info "Loading shared helper: common.sh"
+    # shellcheck source=/dev/null
+    source "${common_file}"
+    log_ok "Shared helper loaded."
+  else
+    log_warn "No common.sh helper found. Continuing with bootstrap built-in helpers."
+  fi
+}
+
+# ------------------------------------------------------------------------------
 # Module Discovery
 # ------------------------------------------------------------------------------
 
@@ -189,8 +227,6 @@ discover_modules() {
     local module_name
     module_name="$(basename "${module_path}")"
 
-    # common.sh is treated as shared library/helper file.
-    # It is not executed as a bootstrap module.
     if [[ "${module_name}" == "common.sh" ]]; then
       log_info "Skipping shared helper: ${module_name}"
       continue
@@ -207,10 +243,7 @@ discover_modules() {
     exit 1
   fi
 
-  # Sort modules alphabetically for deterministic execution.
-  # Later, we can support numeric prefixes like:
-  # 010-packages.sh, 020-NTP.sh, 030-ipv4.sh
-  mapfile -t MODULES < <(printf "%s\n" "${MODULES[@]}" | sort)
+  mapfile -t MODULES < <(printf "%s\n" "${MODULES[@]}" | sort -V)
 
   log_info "Discovered modules in execution order:"
 
@@ -226,17 +259,13 @@ get_module_function_name() {
 
   base_name="$(basename "${module}" .sh)"
 
-  # Sanitize filename into a bash-safe function prefix.
-  # Examples:
-  #   packages.sh       -> packages_main
-  #   NTP.sh            -> NTP_main
-  #   010-packages.sh   -> packages_main
-  #   020-ipv4.sh       -> ipv4_main
-  #
-  # Removes leading numeric ordering prefixes.
+  # Supports ordered names:
+  #   010-packages.sh -> packages_main
+  #   020-NTP.sh      -> NTP_main
+  #   packages.sh     -> packages_main
   base_name="$(echo "${base_name}" | sed -E 's/^[0-9]+[-_]?//')"
 
-  # Replace invalid function-name characters with underscore.
+  # Make bash-safe.
   base_name="$(echo "${base_name}" | sed -E 's/[^a-zA-Z0-9_]/_/g')"
 
   echo "${base_name}_main"
@@ -246,6 +275,7 @@ validate_module_contracts() {
   log_section "Validating Module Contracts"
 
   local module
+
   for module in "${MODULES[@]}"; do
     local module_path="${MODULE_DIR}/${module}"
     local module_function
@@ -254,7 +284,11 @@ validate_module_contracts() {
 
     log_info "Checking ${module} -> ${module_function}()"
 
-    # Load module to inspect function.
+    if ! bash -n "${module_path}"; then
+      log_error "Syntax error in module: ${module}"
+      exit 1
+    fi
+
     # shellcheck source=/dev/null
     source "${module_path}"
 
@@ -287,6 +321,12 @@ run_module() {
     return 1
   fi
 
+  if ! bash -n "${module_path}"; then
+    log_error "Module syntax check failed: ${module}"
+    echo "${module}" > "${FAILED_FILE}"
+    return 1
+  fi
+
   # shellcheck source=/dev/null
   source "${module_path}"
 
@@ -313,27 +353,14 @@ run_module() {
 }
 
 run_automated_mode() {
-  log_section "Automated Bootstrap Mode"
+  log_section "Automated Module Installation"
 
-  log_info "The following modules will run in order:"
+  log_info "Modules will run in this order:"
 
   local module
   for module in "${MODULES[@]}"; do
     log_info "  - ${module}"
   done
-
-  echo ""
-  read -rp "Proceed with automated bootstrap? [y/N]: " confirm
-
-  case "${confirm}" in
-    y|Y|yes|YES)
-      log_info "Starting automated bootstrap."
-      ;;
-    *)
-      log_warn "Automated bootstrap cancelled by user."
-      return 0
-      ;;
-  esac
 
   echo "STARTED:AUTOMATED" > "${STATE_FILE}"
 
@@ -350,8 +377,8 @@ run_automated_mode() {
 
   echo "COMPLETED:AUTOMATED" > "${STATE_FILE}"
 
-  log_section "Automated Bootstrap Completed Successfully"
-  log_ok "All discovered modules completed."
+  log_section "Automated Module Installation Completed"
+  log_ok "All discovered modules completed successfully."
 }
 
 run_manual_mode() {
@@ -372,10 +399,11 @@ run_manual_mode() {
     echo ""
     echo "  r) Retry last failed module"
     echo "  l) List discovered modules"
-    echo "  q) Quit"
+    echo "  q) Quit manual mode"
     echo ""
 
-    read -rp "Enter choice: " choice
+    local choice
+    read_tty "Enter choice: " choice
 
     case "${choice}" in
       q|Q)
@@ -402,7 +430,7 @@ run_manual_mode() {
             log_warn "Failed module file is empty."
           fi
         else
-          log_warn "No failed module found."
+          log_warn "No failed module marker found."
         fi
         ;;
 
@@ -433,11 +461,11 @@ run_validation_only() {
   validate_module_contracts
   show_context
 
-  log_ok "Validation completed successfully."
+  log_ok "Bootstrap validation completed successfully."
 }
 
 # ------------------------------------------------------------------------------
-# Main Menu
+# Interactive Menu
 # ------------------------------------------------------------------------------
 
 show_menu() {
@@ -448,7 +476,7 @@ show_menu() {
   echo ""
   echo " Select bootstrap mode:"
   echo ""
-  echo "  1) Automated bootstrap"
+  echo "  1) Automated module installation"
   echo "     Discover and run all modules in sequence."
   echo ""
   echo "  2) Manual module selection"
@@ -461,21 +489,12 @@ show_menu() {
   echo ""
 }
 
-main() {
-  require_root
-  prepare_directories
-
-  log_section "CAPAC Rocky 8.10 CAE/HPC Bootstrap Started"
-
-  validate_rocky
-  validate_structure
-  discover_modules
-  validate_module_contracts
-  show_context
+interactive_menu() {
+  local choice
 
   while true; do
     show_menu
-    read -rp "Enter choice: " choice
+    read_tty "Enter choice: " choice
 
     case "${choice}" in
       1)
@@ -499,9 +518,57 @@ main() {
         ;;
     esac
   done
+}
+
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
+
+main() {
+  require_root
+  prepare_directories
+
+  log_section "CAPAC Rocky 8.10 CAE/HPC Bootstrap Started"
+
+  validate_rocky
+  validate_structure
+  load_common_if_present
+  discover_modules
+  validate_module_contracts
+  show_context
+
+  case "${1:-}" in
+    --auto)
+      log_info "Bootstrap started in automated mode."
+      run_automated_mode
+      ;;
+
+    --manual)
+      log_info "Bootstrap started in manual mode."
+      run_manual_mode
+      ;;
+
+    --validate)
+      log_info "Bootstrap started in validation mode."
+      log_ok "Validation already completed successfully."
+      ;;
+
+    "")
+      interactive_menu
+      ;;
+
+    *)
+      log_error "Unknown bootstrap option: ${1}"
+      log_info "Supported options:"
+      log_info "  --auto"
+      log_info "  --manual"
+      log_info "  --validate"
+      exit 1
+      ;;
+  esac
 
   log_section "Bootstrap Finished"
-  log_info "Log file: ${LOG_FILE}"
+  log_info "Log file  : ${LOG_FILE}"
   log_info "State file: ${STATE_FILE}"
 }
 
