@@ -55,7 +55,7 @@ slurm_main() {
 slurm_set_defaults() {
   log_section "Loading Slurm Cluster Defaults"
 
-  CLUSTER_NAME="${CLUSTER_NAME:-capac-cfd}"
+  CLUSTER_NAME="${CLUSTER_NAME:-capac-hpc}"
   PARTITION_NAME="${PARTITION_NAME:-cfd}"
 
   MASTER_HOST="${MASTER_HOST:-cae-01}"
@@ -262,6 +262,11 @@ slurm_install_packages() {
     return 1
   fi
 
+  if ! command -v munged >/dev/null 2>&1; then
+    log_error "munged not found after package install. Munge package is missing."
+    return 1
+  fi
+
   log_ok "Slurm/Munge/MariaDB/environment-modules package installation completed."
 }
 
@@ -428,16 +433,23 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# Munge
+# Munge - hardened
 # ------------------------------------------------------------------------------
 
 slurm_configure_munge() {
   log_section "Configuring Munge"
 
+  dnf install -y munge munge-libs munge-devel || true
+
+  systemctl stop munge 2>/dev/null || true
+
+  rm -f /run/munge/munge.socket.2 /run/munge/munged.pid 2>/dev/null || true
+  rm -f /var/run/munge/munge.socket.2 /var/run/munge/munged.pid 2>/dev/null || true
+
   mkdir -p /etc/munge /var/lib/munge /var/log/munge /run/munge
 
   if [[ "${NODE_ROLE}" == "master" ]]; then
-    if [[ ! -f /etc/munge/munge.key ]]; then
+    if [[ ! -s /etc/munge/munge.key ]]; then
       log_info "Generating Munge key on master using /dev/urandom."
       dd if=/dev/urandom of=/etc/munge/munge.key bs=1024 count=1 status=none
       log_ok "Munge key generated."
@@ -445,20 +457,41 @@ slurm_configure_munge() {
       log_ok "Munge key already exists on master."
     fi
   else
-    if [[ ! -f /etc/munge/munge.key ]]; then
+    if [[ ! -s /etc/munge/munge.key ]]; then
       log_warn "Munge key missing on compute node."
       log_warn "It must be copied from ${MASTER_HOST}:/etc/munge/munge.key"
     fi
   fi
 
   chown -R munge:munge /etc/munge /var/lib/munge /var/log/munge /run/munge || true
-  chmod 0700 /etc/munge /var/lib/munge /var/log/munge /run/munge || true
+
+  chmod 0700 /etc/munge
+  chmod 0711 /var/lib/munge
+  chmod 0700 /var/log/munge
+  chmod 0755 /run/munge
   chmod 0400 /etc/munge/munge.key 2>/dev/null || true
 
-  systemctl enable --now munge
+  systemctl daemon-reload
+  systemctl enable munge
   systemctl restart munge
 
-  log_ok "Munge configured and started."
+  sleep 2
+
+  if ! systemctl is-active munge >/dev/null 2>&1; then
+    log_error "Munge failed to start."
+    systemctl status munge --no-pager -l || true
+    journalctl -u munge -n 80 --no-pager || true
+    return 1
+  fi
+
+  if ! munge -n | unmunge >/dev/null 2>&1; then
+    log_error "Munge socket/authentication test failed."
+    systemctl status munge --no-pager -l || true
+    journalctl -u munge -n 80 --no-pager || true
+    return 1
+  fi
+
+  log_ok "Munge configured, started, and validated."
 }
 
 # ------------------------------------------------------------------------------
@@ -803,8 +836,13 @@ slurm_sync_to_compute_if_master() {
   rsync -av /usr/local/sbin/capac-add-hpc-user root@"${COMPUTE_HOST}":/usr/local/sbin/capac-add-hpc-user
 
   ssh root@"${COMPUTE_HOST}" "
+    rm -f /run/munge/munge.socket.2 /run/munge/munged.pid /var/run/munge/munge.socket.2 /var/run/munge/munged.pid 2>/dev/null || true
+
     chown -R munge:munge /etc/munge /var/lib/munge /var/log/munge /run/munge 2>/dev/null || true
-    chmod 0700 /etc/munge /var/lib/munge /var/log/munge /run/munge 2>/dev/null || true
+    chmod 0700 /etc/munge
+    chmod 0711 /var/lib/munge
+    chmod 0700 /var/log/munge
+    chmod 0755 /run/munge
     chmod 0400 /etc/munge/munge.key
 
     chown -R ${SLURM_USER}:${HPC_GROUP} /etc/slurm /var/log/slurm /var/spool/slurmd 2>/dev/null || true
@@ -835,22 +873,57 @@ slurm_sync_to_compute_if_master() {
 slurm_enable_services() {
   log_section "Enabling Slurm Services"
 
-  systemctl enable --now munge
+  systemctl enable munge
   systemctl restart munge
+
+  sleep 2
+
+  if ! munge -n | unmunge >/dev/null 2>&1; then
+    log_error "Munge validation failed. Not starting Slurm services."
+    systemctl status munge --no-pager -l || true
+    journalctl -u munge -n 80 --no-pager || true
+    return 1
+  fi
 
   if [[ "${NODE_ROLE}" == "master" ]]; then
     systemctl enable --now mariadb
-    systemctl enable --now slurmdbd
+
+    systemctl enable slurmdbd
     systemctl restart slurmdbd
 
     sleep 3
 
-    systemctl enable --now slurmctld
+    if ! systemctl is-active slurmdbd >/dev/null 2>&1; then
+      log_error "slurmdbd failed to start."
+      systemctl status slurmdbd --no-pager -l || true
+      journalctl -u slurmdbd -n 80 --no-pager || true
+      return 1
+    fi
+
+    systemctl enable slurmctld
     systemctl restart slurmctld
+
+    sleep 3
+
+    if ! systemctl is-active slurmctld >/dev/null 2>&1; then
+      log_error "slurmctld failed to start."
+      systemctl status slurmctld --no-pager -l || true
+      journalctl -u slurmctld -n 80 --no-pager || true
+      return 1
+    fi
   fi
 
-  systemctl enable --now slurmd
+  systemctl enable slurmd
   systemctl restart slurmd
+
+  sleep 2
+
+  if ! systemctl is-active slurmd >/dev/null 2>&1; then
+    log_error "slurmd failed to start."
+    systemctl status slurmd --no-pager -l || true
+    journalctl -u slurmd -n 80 --no-pager || true
+    return 1
+  fi
 
   log_ok "Slurm services enabled/restarted."
 }
@@ -867,6 +940,11 @@ slurm_register_accounting_if_master() {
   log_section "Registering Slurm Accounting Cluster"
 
   sleep 3
+
+  if ! munge -n | unmunge >/dev/null 2>&1; then
+    log_error "Munge is not healthy. Skipping sacctmgr registration."
+    return 1
+  fi
 
   if command -v sacctmgr >/dev/null 2>&1; then
     sacctmgr -i add cluster "${CLUSTER_NAME}" || true
