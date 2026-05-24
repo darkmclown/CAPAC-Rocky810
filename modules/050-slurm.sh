@@ -7,37 +7,32 @@ set -Eeuo pipefail
 #
 # Purpose:
 #   Configure Slurm + Munge + MariaDB accounting + Environment Modules + MPI
-#   for a 2-node CAE/HPC CFD cluster.
+#   with reusable HPC user access management.
 #
 # Cluster:
 #   Master/controller/compute : cae-01 / 192.168.2.131
 #   Compute node              : cae-03 / 192.168.2.133
 #
-# Design:
-#   - cae-01 runs slurmctld, slurmdbd, MariaDB, munge, slurmd
-#   - cae-03 runs munge and slurmd
-#   - Both nodes can run solver jobs
-#   - Partition: cfd
-#   - CPUs per node: 40
-#   - RAM per node: 380 GB
-#   - Accounting: MariaDB
-#   - Module system: environment-modules
-#   - Modulefiles path: /opt/modulefiles
-#   - Scratch path: /home/data/scratch
+# Access model:
+#   - Shared group: hpc
+#   - Default job user: cadfem
+#   - Slurm service user: slurm
+#   - Any future user added to hpc can run jobs and access shared directories
 #
 # Required function:
 #   slurm_main()
 # ==============================================================================
 
 slurm_main() {
-  log_section "Slurm + Munge + MariaDB + Environment Modules"
+  log_section "Slurm + Munge + MariaDB + Environment Modules + HPC Access"
 
   slurm_set_defaults
   slurm_detect_role
   slurm_validate_hostname
   slurm_configure_hosts
   slurm_install_packages
-  slurm_create_users_and_dirs
+  slurm_create_users_groups_dirs
+  slurm_install_hpc_user_helper
   slurm_configure_munge
   slurm_configure_mariadb_if_master
   slurm_write_configs
@@ -50,7 +45,7 @@ slurm_main() {
   slurm_create_test_jobs_if_master
   slurm_summary
 
-  log_ok "Slurm + Munge + MariaDB + Environment Modules completed successfully."
+  log_ok "Slurm + Munge + MariaDB + Environment Modules + HPC Access completed successfully."
 }
 
 # ------------------------------------------------------------------------------
@@ -78,7 +73,8 @@ slurm_set_defaults() {
   SHARED_SCRATCH_PATH="${SHARED_SCRATCH_PATH:-/home/data/scratch}"
 
   SLURM_USER="${SLURM_USER:-slurm}"
-  MUNGE_USER="${MUNGE_USER:-munge}"
+  RUN_USER="${RUN_USER:-cadfem}"
+  HPC_GROUP="${HPC_GROUP:-hpc}"
   SSH_ADMIN_USER="${SSH_ADMIN_USER:-cadfem}"
 
   SLURM_DB_NAME="${SLURM_DB_NAME:-slurm_acct_db}"
@@ -94,6 +90,9 @@ slurm_set_defaults() {
   log_info "Compute           : ${COMPUTE_HOST} / ${COMPUTE_IP}"
   log_info "Node CPUs         : ${NODE_CPUS}"
   log_info "Node RealMemory   : ${NODE_REALMEMORY} MB"
+  log_info "Run user          : ${RUN_USER}"
+  log_info "Slurm user        : ${SLURM_USER}"
+  log_info "HPC group         : ${HPC_GROUP}"
   log_info "App path          : ${SHARED_APP_PATH}"
   log_info "Data path         : ${SHARED_DATA_PATH}"
   log_info "Scratch path      : ${SHARED_SCRATCH_PATH}"
@@ -178,7 +177,7 @@ slurm_validate_hostname() {
 }
 
 # ------------------------------------------------------------------------------
-# /etc/hosts
+# Hosts
 # ------------------------------------------------------------------------------
 
 slurm_configure_hosts() {
@@ -219,6 +218,7 @@ slurm_install_packages() {
     munge-libs \
     munge-devel \
     environment-modules \
+    acl \
     hwloc \
     hwloc-libs \
     numactl \
@@ -266,11 +266,18 @@ slurm_install_packages() {
 }
 
 # ------------------------------------------------------------------------------
-# Users and Directories
+# Users, Groups, Directories, ACLs
 # ------------------------------------------------------------------------------
 
-slurm_create_users_and_dirs() {
-  log_section "Creating Slurm Users and Directories"
+slurm_create_users_groups_dirs() {
+  log_section "Creating Slurm Users, HPC Group, Directories and ACLs"
+
+  if ! getent group "${HPC_GROUP}" >/dev/null 2>&1; then
+    groupadd "${HPC_GROUP}"
+    log_ok "Created group: ${HPC_GROUP}"
+  else
+    log_ok "Group exists: ${HPC_GROUP}"
+  fi
 
   if ! id "${SLURM_USER}" >/dev/null 2>&1; then
     useradd --system --home /var/lib/slurm --shell /sbin/nologin "${SLURM_USER}" || true
@@ -278,6 +285,18 @@ slurm_create_users_and_dirs() {
   else
     log_ok "User exists: ${SLURM_USER}"
   fi
+
+  if ! id "${RUN_USER}" >/dev/null 2>&1; then
+    log_warn "Run user ${RUN_USER} does not exist. Creating user."
+    useradd -m -s /bin/bash "${RUN_USER}"
+    passwd "${RUN_USER}"
+    log_ok "Created run user: ${RUN_USER}"
+  else
+    log_ok "Run user exists: ${RUN_USER}"
+  fi
+
+  usermod -aG "${HPC_GROUP}" "${RUN_USER}" || true
+  usermod -aG "${HPC_GROUP}" "${SLURM_USER}" || true
 
   mkdir -p \
     /etc/slurm \
@@ -290,12 +309,122 @@ slurm_create_users_and_dirs() {
     "${SHARED_DATA_PATH}" \
     "${SHARED_SCRATCH_PATH}"
 
-  chown -R "${SLURM_USER}:${SLURM_USER}" /var/lib/slurm /var/spool/slurmctld /var/spool/slurmd /var/log/slurm
-  chmod 755 /etc/slurm
-  chmod 755 "${SHARED_APP_PATH}" "${MODULEFILES_PATH}" "${SHARED_DATA_PATH}"
-  chmod 1777 "${SHARED_SCRATCH_PATH}"
+  chown -R "${SLURM_USER}:${HPC_GROUP}" /var/lib/slurm
+  chown -R "${SLURM_USER}:${HPC_GROUP}" /var/spool/slurmctld
+  chown -R "${SLURM_USER}:${HPC_GROUP}" /var/spool/slurmd
+  chown -R "${SLURM_USER}:${HPC_GROUP}" /var/log/slurm
+  chown -R "${SLURM_USER}:${HPC_GROUP}" /etc/slurm
 
-  log_ok "Slurm directories and shared paths are ready."
+  chmod 775 /var/lib/slurm
+  chmod 775 /var/spool/slurmctld
+  chmod 775 /var/spool/slurmd
+  chmod 775 /var/log/slurm
+  chmod 755 /etc/slurm
+
+  chown -R root:"${HPC_GROUP}" "${SHARED_APP_PATH}"
+  chown -R root:"${HPC_GROUP}" "${MODULEFILES_PATH}"
+  chown -R "${RUN_USER}:${HPC_GROUP}" "${SHARED_DATA_PATH}"
+  chown -R "${RUN_USER}:${HPC_GROUP}" "${SHARED_SCRATCH_PATH}"
+
+  chmod 2775 "${SHARED_APP_PATH}"
+  chmod 2775 "${MODULEFILES_PATH}"
+  chmod 2775 "${SHARED_DATA_PATH}"
+  chmod 2777 "${SHARED_SCRATCH_PATH}"
+
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -R -m g:"${HPC_GROUP}":rwx "${SHARED_APP_PATH}" "${MODULEFILES_PATH}" "${SHARED_DATA_PATH}" "${SHARED_SCRATCH_PATH}" || true
+    setfacl -R -d -m g:"${HPC_GROUP}":rwx "${SHARED_APP_PATH}" "${MODULEFILES_PATH}" "${SHARED_DATA_PATH}" "${SHARED_SCRATCH_PATH}" || true
+
+    setfacl -R -m u:"${RUN_USER}":rwx /var/log/slurm /var/spool/slurmd || true
+    setfacl -R -m u:"${SLURM_USER}":rwx /var/log/slurm /var/spool/slurmd /var/spool/slurmctld || true
+  else
+    log_warn "setfacl not found. ACL inheritance skipped."
+  fi
+
+  log_ok "Users, group access, directory permissions and ACLs configured."
+}
+
+# ------------------------------------------------------------------------------
+# Future HPC User Helper
+# ------------------------------------------------------------------------------
+
+slurm_install_hpc_user_helper() {
+  log_section "Installing Future HPC User Helper"
+
+  cat > /usr/local/sbin/capac-add-hpc-user <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+HPC_GROUP="${HPC_GROUP}"
+SHARED_APP_PATH="${SHARED_APP_PATH}"
+MODULEFILES_PATH="${MODULEFILES_PATH}"
+SHARED_DATA_PATH="${SHARED_DATA_PATH}"
+SHARED_SCRATCH_PATH="${SHARED_SCRATCH_PATH}"
+
+if [[ "\${EUID}" -ne 0 ]]; then
+  echo "Run as root or sudo."
+  exit 1
+fi
+
+if [[ "\${1:-}" == "" ]]; then
+  echo "Usage: sudo capac-add-hpc-user <username>"
+  exit 1
+fi
+
+NEW_USER="\$1"
+
+if ! getent group "\${HPC_GROUP}" >/dev/null 2>&1; then
+  groupadd "\${HPC_GROUP}"
+fi
+
+if ! id "\${NEW_USER}" >/dev/null 2>&1; then
+  useradd -m -s /bin/bash "\${NEW_USER}"
+  passwd "\${NEW_USER}"
+else
+  echo "User exists: \${NEW_USER}"
+fi
+
+usermod -aG "\${HPC_GROUP}" "\${NEW_USER}"
+
+mkdir -p "\${SHARED_APP_PATH}" "\${MODULEFILES_PATH}" "\${SHARED_DATA_PATH}" "\${SHARED_SCRATCH_PATH}"
+
+chown -R root:"\${HPC_GROUP}" "\${SHARED_APP_PATH}" "\${MODULEFILES_PATH}"
+chown -R root:"\${HPC_GROUP}" "\${SHARED_DATA_PATH}" "\${SHARED_SCRATCH_PATH}"
+
+chmod 2775 "\${SHARED_APP_PATH}" "\${MODULEFILES_PATH}" "\${SHARED_DATA_PATH}"
+chmod 2777 "\${SHARED_SCRATCH_PATH}"
+
+if command -v setfacl >/dev/null 2>&1; then
+  setfacl -R -m g:"\${HPC_GROUP}":rwx "\${SHARED_APP_PATH}" "\${MODULEFILES_PATH}" "\${SHARED_DATA_PATH}" "\${SHARED_SCRATCH_PATH}" || true
+  setfacl -R -d -m g:"\${HPC_GROUP}":rwx "\${SHARED_APP_PATH}" "\${MODULEFILES_PATH}" "\${SHARED_DATA_PATH}" "\${SHARED_SCRATCH_PATH}" || true
+  setfacl -R -m u:"\${NEW_USER}":rwx "\${SHARED_DATA_PATH}" "\${SHARED_SCRATCH_PATH}" || true
+fi
+
+cat > /etc/profile.d/capac-hpc-user-path.sh <<'PROFILEEOF'
+# CAPAC HPC user environment
+if [[ -f /etc/profile.d/modules.sh ]]; then
+  source /etc/profile.d/modules.sh
+fi
+
+if command -v module >/dev/null 2>&1; then
+  module use /opt/modulefiles >/dev/null 2>&1 || true
+fi
+PROFILEEOF
+
+echo "User \${NEW_USER} is ready for HPC/Slurm jobs."
+echo "Ask user to logout/login once to inherit group membership."
+echo "Validation:"
+echo "  id \${NEW_USER}"
+echo "  sudo -u \${NEW_USER} touch ${SHARED_SCRATCH_PATH}/\${NEW_USER}-test.txt"
+echo "  sudo -u \${NEW_USER} sbatch /opt/slurm-tests/cpu-test.sbatch"
+EOF
+
+  chmod 755 /usr/local/sbin/capac-add-hpc-user
+  chown root:root /usr/local/sbin/capac-add-hpc-user
+
+  log_ok "Installed helper: /usr/local/sbin/capac-add-hpc-user"
+  log_info "Future user command:"
+  log_info "  sudo capac-add-hpc-user <username>"
 }
 
 # ------------------------------------------------------------------------------
@@ -309,8 +438,9 @@ slurm_configure_munge() {
 
   if [[ "${NODE_ROLE}" == "master" ]]; then
     if [[ ! -f /etc/munge/munge.key ]]; then
-      log_info "Generating Munge key on master."
-      /usr/sbin/create-munge-key -r || dd if=/dev/urandom bs=1 count=1024 of=/etc/munge/munge.key
+      log_info "Generating Munge key on master using /dev/urandom."
+      dd if=/dev/urandom of=/etc/munge/munge.key bs=1024 count=1 status=none
+      log_ok "Munge key generated."
     else
       log_ok "Munge key already exists on master."
     fi
@@ -332,7 +462,7 @@ slurm_configure_munge() {
 }
 
 # ------------------------------------------------------------------------------
-# MariaDB Accounting on Master
+# MariaDB Accounting
 # ------------------------------------------------------------------------------
 
 slurm_configure_mariadb_if_master() {
@@ -442,11 +572,9 @@ AccountingStorageTRES=gres/gpu,cpu,mem,node,billing,fs/disk,vmem,pages
 PriorityType=priority/multifactor
 LaunchParameters=use_interactive_step
 
-# Nodes
 NodeName=${MASTER_HOST} NodeAddr=${MASTER_IP} CPUs=${NODE_CPUS} RealMemory=${NODE_REALMEMORY} Sockets=1 CoresPerSocket=${NODE_CPUS} ThreadsPerCore=1 State=UNKNOWN
 NodeName=${COMPUTE_HOST} NodeAddr=${COMPUTE_IP} CPUs=${NODE_CPUS} RealMemory=${NODE_REALMEMORY} Sockets=1 CoresPerSocket=${NODE_CPUS} ThreadsPerCore=1 State=UNKNOWN
 
-# CFD partition
 PartitionName=${PARTITION_NAME} Nodes=${MASTER_HOST},${COMPUTE_HOST} Default=YES MaxTime=INFINITE State=UP OverSubscribe=NO
 EOF
 
@@ -492,11 +620,11 @@ StoragePass=${SLURM_DB_PASS}
 EOF
 
     chmod 600 "${slurmdbd_conf}"
-    chown "${SLURM_USER}:${SLURM_USER}" "${slurmdbd_conf}" || true
+    chown "${SLURM_USER}:${HPC_GROUP}" "${slurmdbd_conf}" || true
   fi
 
   chmod 644 "${slurm_conf}" "${cgroup_conf}"
-  chown -R "${SLURM_USER}:${SLURM_USER}" /etc/slurm /var/log/slurm /var/spool/slurmctld /var/spool/slurmd
+  chown -R "${SLURM_USER}:${HPC_GROUP}" /etc/slurm /var/log/slurm /var/spool/slurmctld /var/spool/slurmd
 
   log_ok "Slurm configuration written."
 }
@@ -509,7 +637,8 @@ slurm_configure_environment_modules() {
   log_section "Configuring Environment Modules"
 
   mkdir -p "${MODULEFILES_PATH}"
-  chmod 755 "${MODULEFILES_PATH}"
+  chmod 2775 "${MODULEFILES_PATH}"
+  chown -R root:"${HPC_GROUP}" "${MODULEFILES_PATH}"
 
   cat > /etc/profile.d/capac-modules.sh <<EOF
 # CAPAC Environment Modules path
@@ -527,9 +656,6 @@ EOF
 
   cat > "${MODULEFILES_PATH}/openmpi/rocky8" <<'EOF'
 #%Module1.0#####################################################################
-##
-## OpenMPI module for CAPAC Rocky 8 CAE/HPC cluster
-##
 
 proc ModulesHelp { } {
     puts stderr "Loads OpenMPI from Rocky/EPEL packages."
@@ -545,8 +671,10 @@ setenv MPI_HOME /usr/lib64/openmpi
 setenv OMPI_MCA_btl self,vader,tcp
 EOF
 
+  chown -R root:"${HPC_GROUP}" "${MODULEFILES_PATH}"
+  chmod -R g+rwX "${MODULEFILES_PATH}"
+
   log_ok "Environment Modules configured."
-  log_info "Modulefiles path: ${MODULEFILES_PATH}"
 }
 
 # ------------------------------------------------------------------------------
@@ -565,8 +693,6 @@ slurm_configure_intel_mpi_module() {
   fi
 
   if [[ "${INSTALL_INTEL_MPI}" == "yes" ]]; then
-    log_info "Adding Intel oneAPI repository and installing Intel MPI packages."
-
     rpm --import https://yum.repos.intel.com/oneapi/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB || true
 
     cat > /etc/yum.repos.d/intel-oneapi.repo <<'EOF'
@@ -580,18 +706,13 @@ gpgkey=https://yum.repos.intel.com/oneapi/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
 EOF
 
     dnf makecache -y || true
-    dnf install -y intel-oneapi-mpi intel-oneapi-mpi-devel || {
-      log_warn "Intel MPI package install failed. Modulefile will still be created."
-    }
+    dnf install -y intel-oneapi-mpi intel-oneapi-mpi-devel || true
   fi
 
   mkdir -p "${MODULEFILES_PATH}/intel-mpi"
 
   cat > "${MODULEFILES_PATH}/intel-mpi/oneapi" <<EOF
 #%Module1.0#####################################################################
-##
-## Intel MPI module for CAPAC CAE/HPC cluster
-##
 
 proc ModulesHelp { } {
     puts stderr "Loads Intel MPI from Intel oneAPI if installed under ${INTEL_ONEAPI_ROOT}."
@@ -599,7 +720,6 @@ proc ModulesHelp { } {
 
 module-whatis "Intel MPI from oneAPI"
 
-set oneapi_root ${INTEL_ONEAPI_ROOT}
 set mpi_root ${INTEL_ONEAPI_ROOT}/mpi/latest
 
 if { ! [file isdirectory \$mpi_root] } {
@@ -612,13 +732,15 @@ prepend-path MANPATH \$mpi_root/share/man
 
 setenv I_MPI_ROOT \$mpi_root
 setenv MPI_HOME \$mpi_root
-
 setenv I_MPI_FABRICS shm:tcp
 setenv I_MPI_PIN 1
 setenv I_MPI_PIN_DOMAIN core
 EOF
 
-  log_ok "Intel MPI modulefile created: ${MODULEFILES_PATH}/intel-mpi/oneapi"
+  chown -R root:"${HPC_GROUP}" "${MODULEFILES_PATH}/intel-mpi"
+  chmod -R g+rwX "${MODULEFILES_PATH}/intel-mpi"
+
+  log_ok "Intel MPI modulefile created."
 }
 
 # ------------------------------------------------------------------------------
@@ -648,11 +770,7 @@ slurm_setup_root_ssh_if_master() {
   log_warn "Passwordless root SSH to ${COMPUTE_HOST} is not working."
 
   if slurm_confirm "Setup root SSH key copy to ${COMPUTE_HOST} now? [y/N]: "; then
-    ssh-copy-id -o StrictHostKeyChecking=no root@"${COMPUTE_HOST}" || {
-      log_warn "root ssh-copy-id failed."
-      log_warn "Manual command:"
-      log_warn "  sudo ssh-copy-id root@${COMPUTE_HOST}"
-    }
+    ssh-copy-id -o StrictHostKeyChecking=no root@"${COMPUTE_HOST}" || true
   fi
 }
 
@@ -661,7 +779,7 @@ slurm_sync_to_compute_if_master() {
     return 0
   fi
 
-  log_section "Syncing Slurm and Munge Configs to Compute Node"
+  log_section "Syncing Slurm, Munge, Modules and Access Configs to Compute Node"
 
   if ! ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@"${COMPUTE_HOST}" "hostname -s" >/dev/null 2>&1; then
     log_warn "Skipping automatic sync because root SSH is not ready."
@@ -671,19 +789,38 @@ slurm_sync_to_compute_if_master() {
     return 0
   fi
 
-  ssh root@"${COMPUTE_HOST}" "mkdir -p /etc/munge /etc/slurm /var/log/slurm /var/spool/slurmd ${SHARED_SCRATCH_PATH} ${MODULEFILES_PATH}"
+  ssh root@"${COMPUTE_HOST}" "
+    mkdir -p /etc/munge /etc/slurm /var/lib/munge /var/log/munge /run/munge /var/log/slurm /var/spool/slurmd ${SHARED_APP_PATH} ${MODULEFILES_PATH} ${SHARED_DATA_PATH} ${SHARED_SCRATCH_PATH}
+    getent group ${HPC_GROUP} >/dev/null 2>&1 || groupadd ${HPC_GROUP}
+    id ${RUN_USER} >/dev/null 2>&1 && usermod -aG ${HPC_GROUP} ${RUN_USER} || true
+    id ${SLURM_USER} >/dev/null 2>&1 && usermod -aG ${HPC_GROUP} ${SLURM_USER} || true
+  "
 
   scp /etc/munge/munge.key root@"${COMPUTE_HOST}":/etc/munge/munge.key
   rsync -av /etc/slurm/slurm.conf /etc/slurm/cgroup.conf root@"${COMPUTE_HOST}":/etc/slurm/
   rsync -av "${MODULEFILES_PATH}/" root@"${COMPUTE_HOST}":"${MODULEFILES_PATH}/"
   rsync -av /etc/profile.d/capac-modules.sh root@"${COMPUTE_HOST}":/etc/profile.d/capac-modules.sh
+  rsync -av /usr/local/sbin/capac-add-hpc-user root@"${COMPUTE_HOST}":/usr/local/sbin/capac-add-hpc-user
 
   ssh root@"${COMPUTE_HOST}" "
     chown -R munge:munge /etc/munge /var/lib/munge /var/log/munge /run/munge 2>/dev/null || true
     chmod 0700 /etc/munge /var/lib/munge /var/log/munge /run/munge 2>/dev/null || true
     chmod 0400 /etc/munge/munge.key
-    chown -R ${SLURM_USER}:${SLURM_USER} /etc/slurm /var/log/slurm /var/spool/slurmd 2>/dev/null || true
-    chmod 1777 ${SHARED_SCRATCH_PATH}
+
+    chown -R ${SLURM_USER}:${HPC_GROUP} /etc/slurm /var/log/slurm /var/spool/slurmd 2>/dev/null || true
+    chmod 775 /var/log/slurm /var/spool/slurmd 2>/dev/null || true
+
+    chown -R root:${HPC_GROUP} ${SHARED_APP_PATH} ${MODULEFILES_PATH}
+    chown -R ${RUN_USER}:${HPC_GROUP} ${SHARED_DATA_PATH} ${SHARED_SCRATCH_PATH}
+    chmod 2775 ${SHARED_APP_PATH} ${MODULEFILES_PATH} ${SHARED_DATA_PATH}
+    chmod 2777 ${SHARED_SCRATCH_PATH}
+
+    if command -v setfacl >/dev/null 2>&1; then
+      setfacl -R -m g:${HPC_GROUP}:rwx ${SHARED_APP_PATH} ${MODULEFILES_PATH} ${SHARED_DATA_PATH} ${SHARED_SCRATCH_PATH} || true
+      setfacl -R -d -m g:${HPC_GROUP}:rwx ${SHARED_APP_PATH} ${MODULEFILES_PATH} ${SHARED_DATA_PATH} ${SHARED_SCRATCH_PATH} || true
+    fi
+
+    chmod 755 /usr/local/sbin/capac-add-hpc-user || true
     systemctl restart munge || true
     systemctl restart slurmd || true
   "
@@ -785,11 +922,10 @@ srun bash -c 'echo rank=\${SLURM_PROCID} host=\$(hostname)'
 EOF
 
   chmod +x /opt/slurm-tests/*.sbatch
+  chown -R root:"${HPC_GROUP}" /opt/slurm-tests
+  chmod -R 775 /opt/slurm-tests
 
   log_ok "Test jobs created in /opt/slurm-tests"
-  log_info "Run after both nodes are configured:"
-  log_info "  sbatch /opt/slurm-tests/hostname-test.sbatch"
-  log_info "  sbatch /opt/slurm-tests/cpu-test.sbatch"
 }
 
 # ------------------------------------------------------------------------------
@@ -834,17 +970,33 @@ slurm_summary() {
   fi
 
   command -v module | tee -a "${LOG_FILE}" || true
-  log_info "Modulefiles path: ${MODULEFILES_PATH}"
   find "${MODULEFILES_PATH}" -maxdepth 3 -type f | tee -a "${LOG_FILE}" || true
 
-  log_info "Useful validation commands:"
+  log_info "User and directory access:"
+  id "${RUN_USER}" | tee -a "${LOG_FILE}" || true
+  id "${SLURM_USER}" | tee -a "${LOG_FILE}" || true
+  getent group "${HPC_GROUP}" | tee -a "${LOG_FILE}" || true
+
+  ls -ld \
+    "${SHARED_APP_PATH}" \
+    "${MODULEFILES_PATH}" \
+    "${SHARED_DATA_PATH}" \
+    "${SHARED_SCRATCH_PATH}" \
+    /var/log/slurm \
+    /var/spool/slurmd \
+    /var/spool/slurmctld 2>/dev/null | tee -a "${LOG_FILE}" || true
+
+  log_info "Future user onboarding:"
+  log_info "  sudo capac-add-hpc-user <username>"
+
+  log_info "Validation:"
   log_info "  source /etc/profile.d/modules.sh"
   log_info "  module use ${MODULEFILES_PATH}"
   log_info "  module avail"
   log_info "  module load openmpi/rocky8"
   log_info "  scontrol ping"
   log_info "  sinfo -Nel"
-  log_info "  sbatch /opt/slurm-tests/hostname-test.sbatch"
+  log_info "  sudo -u ${RUN_USER} sbatch /opt/slurm-tests/cpu-test.sbatch"
 
   log_ok "Slurm summary completed."
 }
