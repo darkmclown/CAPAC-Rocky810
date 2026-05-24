@@ -8,12 +8,13 @@ set -Eeuo pipefail
 # Purpose:
 #   Configure GUI/VNC/X11 environment for CAE and ANSYS applications.
 #
-# Fixes:
-#   - Avoids systemd stuck in "activating"
-#   - Uses direct Xvnc foreground service with Type=simple
-#   - Starts XFCE after Xvnc comes up
-#   - Remembers safe settings only
-#   - Does not store plaintext passwords
+# Design:
+#   - Uses direct Xvnc systemd service to avoid "activating" issue
+#   - Uses XFCE lightweight desktop
+#   - Supports localhost-only or private-network VNC access
+#   - Opens simple firewall port when VNC_LOCALHOST=no
+#   - Remembers safe settings in /etc/capac-bootstrap/vnc.conf
+#   - Does NOT store plaintext passwords
 #
 # Required function:
 #   vnc_main()
@@ -30,6 +31,7 @@ vnc_main() {
   vnc_create_startxfce_script
   vnc_create_systemd_service
   vnc_enable_service
+  vnc_configure_firewall
   vnc_save_settings
   vnc_summary
 
@@ -42,6 +44,8 @@ vnc_main() {
 
 vnc_install_packages() {
   log_section "Installing VNC, XFCE, and X11 Packages"
+
+  log_info "Installing XFCE desktop group if available..."
 
   dnf groupinstall -y "Xfce" || \
   dnf groupinstall -y "Xfce Desktop" || {
@@ -57,6 +61,8 @@ vnc_install_packages() {
       tumbler \
       mousepad || true
   }
+
+  log_info "Installing TigerVNC, X11 forwarding, fonts, and OpenGL packages..."
 
   dnf install -y \
     tigervnc-server \
@@ -111,8 +117,13 @@ vnc_read_secret_tty() {
   local prompt="$1"
   local var_name="$2"
 
-  read -rsp "${prompt}" "${var_name}" < /dev/tty
-  echo > /dev/tty
+  if [[ -r /dev/tty ]]; then
+    read -rsp "${prompt}" "${var_name}" < /dev/tty
+    echo > /dev/tty
+  else
+    log_error "No interactive terminal available for password input."
+    return 1
+  fi
 }
 
 vnc_confirm() {
@@ -150,11 +161,12 @@ vnc_load_or_collect_settings() {
     # shellcheck source=/dev/null
     source "${VNC_CONFIG_FILE}"
 
-    log_info "Saved VNC user      : ${VNC_USER:-not-set}"
-    log_info "Saved VNC display   : :${VNC_DISPLAY:-1}"
-    log_info "Saved VNC geometry  : ${VNC_GEOMETRY:-1920x1080}"
-    log_info "Saved VNC depth     : ${VNC_DEPTH:-24}"
-    log_info "Saved localhost mode: ${VNC_LOCALHOST:-yes}"
+    log_info "Saved VNC user       : ${VNC_USER:-not-set}"
+    log_info "Saved VNC display    : :${VNC_DISPLAY:-1}"
+    log_info "Saved VNC geometry   : ${VNC_GEOMETRY:-1920x1080}"
+    log_info "Saved VNC depth      : ${VNC_DEPTH:-24}"
+    log_info "Saved localhost mode : ${VNC_LOCALHOST:-yes}"
+    log_info "Saved firewall open  : ${VNC_OPEN_FIREWALL:-yes}"
 
     if vnc_confirm "Reuse saved VNC settings? [Y/n]: "; then
       VNC_USER="${VNC_USER:-cadfem}"
@@ -162,6 +174,7 @@ vnc_load_or_collect_settings() {
       VNC_GEOMETRY="${VNC_GEOMETRY:-1920x1080}"
       VNC_DEPTH="${VNC_DEPTH:-24}"
       VNC_LOCALHOST="${VNC_LOCALHOST:-yes}"
+      VNC_OPEN_FIREWALL="${VNC_OPEN_FIREWALL:-yes}"
       vnc_print_settings
       return 0
     fi
@@ -172,6 +185,7 @@ vnc_load_or_collect_settings() {
   VNC_GEOMETRY="${VNC_GEOMETRY:-1920x1080}"
   VNC_DEPTH="${VNC_DEPTH:-24}"
   VNC_LOCALHOST="${VNC_LOCALHOST:-yes}"
+  VNC_OPEN_FIREWALL="${VNC_OPEN_FIREWALL:-yes}"
 
   if [[ -z "${VNC_USER}" ]]; then
     vnc_read_tty "Enter Linux username for VNC service [cadfem]: " VNC_USER
@@ -205,16 +219,33 @@ vnc_load_or_collect_settings() {
       ;;
   esac
 
+  if [[ "${VNC_LOCALHOST}" == "no" ]]; then
+    vnc_read_tty "Open firewall port for VNC? yes/no [${VNC_OPEN_FIREWALL}]: " input_value
+    VNC_OPEN_FIREWALL="${input_value:-${VNC_OPEN_FIREWALL}}"
+
+    case "${VNC_OPEN_FIREWALL}" in
+      y|Y|yes|YES|true|TRUE)
+        VNC_OPEN_FIREWALL="yes"
+        ;;
+      *)
+        VNC_OPEN_FIREWALL="no"
+        ;;
+    esac
+  else
+    VNC_OPEN_FIREWALL="no"
+  fi
+
   vnc_print_settings
 }
 
 vnc_print_settings() {
-  log_info "VNC user      : ${VNC_USER}"
-  log_info "VNC display   : :${VNC_DISPLAY}"
-  log_info "VNC port      : $((5900 + VNC_DISPLAY))"
-  log_info "VNC geometry  : ${VNC_GEOMETRY}"
-  log_info "VNC depth     : ${VNC_DEPTH}"
-  log_info "Localhost only: ${VNC_LOCALHOST}"
+  log_info "VNC user       : ${VNC_USER}"
+  log_info "VNC display    : :${VNC_DISPLAY}"
+  log_info "VNC port       : $((5900 + VNC_DISPLAY))"
+  log_info "VNC geometry   : ${VNC_GEOMETRY}"
+  log_info "VNC depth      : ${VNC_DEPTH}"
+  log_info "Localhost only : ${VNC_LOCALHOST}"
+  log_info "Open firewall  : ${VNC_OPEN_FIREWALL}"
 }
 
 # ------------------------------------------------------------------------------
@@ -338,11 +369,11 @@ vnc_set_password() {
 }
 
 # ------------------------------------------------------------------------------
-# xstartup
+# XFCE / Visual Quality Config
 # ------------------------------------------------------------------------------
 
 vnc_create_xstartup() {
-  log_section "Creating VNC xstartup"
+  log_section "Creating Optimized VNC xstartup"
 
   local xstartup="${VNC_HOME}/.vnc/xstartup"
 
@@ -360,10 +391,25 @@ unset DBUS_SESSION_BUS_ADDRESS
 export XDG_SESSION_TYPE=x11
 export DESKTOP_SESSION=xfce
 export XDG_CURRENT_DESKTOP=XFCE
+export NO_AT_BRIDGE=1
 
-# Reduce noise in virtual VNC sessions.
+# Clean VNC session for CAE / ANSYS GUI usage.
 xfce4-screensaver --quit >/dev/null 2>&1 || true
 xfce4-power-manager --quit >/dev/null 2>&1 || true
+
+# Disable screen lock/power noise where possible.
+xfconf-query -c xfce4-session -p /general/LockCommand -s "" >/dev/null 2>&1 || true
+xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/dpms-enabled -s false >/dev/null 2>&1 || true
+xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/blank-on-ac -s 0 >/dev/null 2>&1 || true
+
+# Improve font/rendering quality.
+xrdb -merge <<XRDB
+Xft.dpi: 96
+Xft.antialias: 1
+Xft.hinting: 1
+Xft.hintstyle: hintslight
+Xft.rgba: rgb
+XRDB
 
 if command -v dbus-launch >/dev/null 2>&1; then
   exec dbus-launch --exit-with-session startxfce4
@@ -375,12 +421,8 @@ EOF
   chown "${VNC_USER}:${VNC_GROUP}" "${xstartup}"
   chmod 755 "${xstartup}"
 
-  log_ok "Created VNC xstartup: ${xstartup}"
+  log_ok "Created optimized VNC xstartup: ${xstartup}"
 }
-
-# ------------------------------------------------------------------------------
-# XFCE Start Helper
-# ------------------------------------------------------------------------------
 
 vnc_create_startxfce_script() {
   log_section "Creating XFCE Start Helper"
@@ -398,7 +440,6 @@ export LOGNAME="${VNC_USER}"
 
 cd "${VNC_HOME}"
 
-# Wait briefly for Xvnc to become ready.
 for i in {1..20}; do
   if xdpyinfo -display ":${VNC_DISPLAY}" >/dev/null 2>&1; then
     break
@@ -425,15 +466,14 @@ vnc_create_systemd_service() {
   log_section "Creating systemd VNC Service"
 
   local service_file="/etc/systemd/system/vncserver@.service"
-  local localhost_flag="-localhost"
+  local localhost_arg=""
 
   if [[ "${VNC_LOCALHOST}" == "yes" ]]; then
-    localhost_flag="-localhost"
+    localhost_arg="-localhost"
   else
-    localhost_flag="-nolisten tcp"
+    localhost_arg=""
   fi
 
-  # Stop old service/session safely before replacing service.
   systemctl stop "vncserver@${VNC_DISPLAY}.service" >/dev/null 2>&1 || true
   pkill -u "${VNC_USER}" -f "Xvnc :${VNC_DISPLAY}" >/dev/null 2>&1 || true
   su - "${VNC_USER}" -c "vncserver -kill :${VNC_DISPLAY}" >/dev/null 2>&1 || true
@@ -459,7 +499,7 @@ Environment=USER=${VNC_USER}
 Environment=LOGNAME=${VNC_USER}
 
 ExecStartPre=/bin/sh -c '/usr/bin/vncserver -kill :%i >/dev/null 2>&1 || true'
-ExecStart=/usr/bin/Xvnc :%i -geometry ${VNC_GEOMETRY} -depth ${VNC_DEPTH} ${localhost_flag} -SecurityTypes VncAuth -PasswordFile ${VNC_HOME}/.vnc/passwd -auth ${VNC_HOME}/.Xauthority
+ExecStart=/usr/bin/Xvnc :%i -geometry ${VNC_GEOMETRY} -depth ${VNC_DEPTH} ${localhost_arg} -SecurityTypes VncAuth -PasswordFile ${VNC_HOME}/.vnc/passwd -auth ${VNC_HOME}/.Xauthority -dpi 96 -AlwaysShared
 ExecStartPost=/bin/sh -c '/usr/local/bin/capac-vnc-startxfce-%i.sh'
 ExecStop=/bin/sh -c '/usr/bin/vncserver -kill :%i >/dev/null 2>&1 || pkill -u ${VNC_USER} -f "Xvnc :%i" || true'
 
@@ -497,6 +537,43 @@ vnc_enable_service() {
 }
 
 # ------------------------------------------------------------------------------
+# Simple Firewall
+# ------------------------------------------------------------------------------
+
+vnc_configure_firewall() {
+  log_section "Configuring Simple Firewall for VNC"
+
+  local vnc_port=$((5900 + VNC_DISPLAY))
+
+  if [[ "${VNC_LOCALHOST}" == "yes" ]]; then
+    log_warn "VNC is localhost-only. Firewall opening skipped."
+    log_info "Use SSH tunnel:"
+    log_info "  ssh -L ${vnc_port}:localhost:${vnc_port} ${VNC_USER}@<server-ip>"
+    return 0
+  fi
+
+  if [[ "${VNC_OPEN_FIREWALL}" != "yes" ]]; then
+    log_warn "Firewall opening skipped by setting."
+    return 0
+  fi
+
+  if ! systemctl is-active firewalld >/dev/null 2>&1; then
+    log_warn "firewalld is not active. Skipping firewall-cmd."
+    return 0
+  fi
+
+  log_info "Opening VNC port ${vnc_port}/tcp in firewalld."
+
+  firewall-cmd --permanent --add-port="${vnc_port}/tcp" || true
+  firewall-cmd --reload || true
+
+  log_ok "Firewall opened for VNC port ${vnc_port}/tcp."
+
+  log_info "Current firewall ports:"
+  firewall-cmd --list-ports || true
+}
+
+# ------------------------------------------------------------------------------
 # Save Safe Settings
 # ------------------------------------------------------------------------------
 
@@ -512,6 +589,7 @@ VNC_DISPLAY="${VNC_DISPLAY}"
 VNC_GEOMETRY="${VNC_GEOMETRY}"
 VNC_DEPTH="${VNC_DEPTH}"
 VNC_LOCALHOST="${VNC_LOCALHOST}"
+VNC_OPEN_FIREWALL="${VNC_OPEN_FIREWALL}"
 EOF
 
   chmod 600 "${VNC_CONFIG_FILE}"
@@ -530,13 +608,16 @@ vnc_summary() {
   local service_name="vncserver@${VNC_DISPLAY}.service"
   local vnc_port=$((5900 + VNC_DISPLAY))
 
-  log_info "VNC user      : ${VNC_USER}"
-  log_info "VNC display   : :${VNC_DISPLAY}"
-  log_info "VNC port      : ${vnc_port}"
-  log_info "VNC geometry  : ${VNC_GEOMETRY}"
-  log_info "VNC service   : ${service_name}"
-  log_info "VNC xstartup  : ${VNC_HOME}/.vnc/xstartup"
-  log_info "Saved config  : ${VNC_CONFIG_FILE}"
+  log_info "VNC user       : ${VNC_USER}"
+  log_info "VNC display    : :${VNC_DISPLAY}"
+  log_info "VNC port       : ${vnc_port}"
+  log_info "VNC geometry   : ${VNC_GEOMETRY}"
+  log_info "VNC depth      : ${VNC_DEPTH}"
+  log_info "Localhost only : ${VNC_LOCALHOST}"
+  log_info "Firewall open  : ${VNC_OPEN_FIREWALL}"
+  log_info "VNC service    : ${service_name}"
+  log_info "VNC xstartup   : ${VNC_HOME}/.vnc/xstartup"
+  log_info "Saved config   : ${VNC_CONFIG_FILE}"
 
   echo ""
   echo "=== VNC HEALTH CHECK ===" | tee -a "${LOG_FILE}"
@@ -554,12 +635,12 @@ vnc_summary() {
     log_warn "VNC is not locally reachable on 127.0.0.1:${vnc_port}"
   fi
 
-  if [[ "${VNC_LOCALHOST}" == "no" ]]; then
+  if [[ "${VNC_LOCALHOST}" == "yes" ]]; then
     log_info "Connect using SSH tunnel:"
     log_info "  ssh -L ${vnc_port}:localhost:${vnc_port} ${VNC_USER}@<server-ip>"
     log_info "  Then open VNC client to localhost:${vnc_port}"
   else
-    log_info "Connect directly:"
+    log_info "Connect directly from private network:"
     log_info "  <server-ip>:${VNC_DISPLAY}"
     log_info "  or <server-ip>:${vnc_port}"
   fi
