@@ -554,7 +554,7 @@ vnc_summary() {
     log_warn "VNC is not locally reachable on 127.0.0.1:${vnc_port}"
   fi
 
-  if [[ "${VNC_LOCALHOST}" == "yes" ]]; then
+  if [[ "${VNC_LOCALHOST}" == "no" ]]; then
     log_info "Connect using SSH tunnel:"
     log_info "  ssh -L ${vnc_port}:localhost:${vnc_port} ${VNC_USER}@<server-ip>"
     log_info "  Then open VNC client to localhost:${vnc_port}"
