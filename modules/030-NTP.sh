@@ -242,7 +242,7 @@ ntp_restart_services() {
 # ------------------------------------------------------------------------------
 
 ntp_summary() {
-  log_section "NTP / Time / Network Summary"
+  log_section "NTP / Time / Network Summary and Diagnostics"
 
   log_info "Timedatectl:"
   timedatectl | tee -a "${LOG_FILE}" || true
