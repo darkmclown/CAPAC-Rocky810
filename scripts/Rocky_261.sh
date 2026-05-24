@@ -14,6 +14,7 @@
 # - This installs the full union of packages across ANSYS products/components found in the document.
 # - Some packages may require EPEL, PowerTools/CRB, AppStream, or vendor repos depending on your Rocky mirror.
 # - Some vendor-specific packages may not exist in every Rocky 8.10 repo. The script reports any missing packages.
+# - rocm-runtime is an AMD ROCm package and is not in standard Rocky/EPEL repos; it is treated as optional.
 
 set -Eeuo pipefail
 
@@ -36,7 +37,7 @@ Options:
   --with-devtools   Install common build/compiler tools in addition to ANSYS library prerequisites.
   --with-hpc        Install common HPC/RDMA/MPI helper packages in addition to prerequisite libraries.
   --skip-repos      Do not enable EPEL / PowerTools / AppStream repositories.
-  --strict          Fail if any requested package cannot be installed.
+  --strict          Fail if any mandatory package cannot be installed. Optional/vendor packages only warn.
   --dry-run         Print actions and package list only; do not install.
   -h, --help        Show help.
 
@@ -339,6 +340,33 @@ HPC_PACKAGES=(
   munge-libs
 )
 
+# Packages from vendor-specific repositories or older compatibility repositories.
+# They are attempted when available, but absence should not block the full ANSYS prerequisite install.
+OPTIONAL_PACKAGES=(
+  rocm-runtime
+  compat-hwloc1
+  compat-openssl10
+  libpng12
+  libXp
+  openssl3-libs
+)
+
+is_optional_pkg() {
+  local candidate="$1"
+  local opt
+  for opt in "${OPTIONAL_PACKAGES[@]}"; do
+    [[ "$candidate" == "$opt" ]] && return 0
+  done
+  return 1
+}
+
+pkg_available_or_installed() {
+  local pkg="$1"
+  rpm -q "$pkg" >/dev/null 2>&1 && return 0
+  dnf -q repoquery --available "$pkg" >/dev/null 2>&1 && return 0
+  return 1
+}
+
 unique_packages() {
   awk '!seen[$0]++'
 }
@@ -381,30 +409,56 @@ else
   log "Skipping repository enablement because --skip-repos was specified."
 fi
 
-log "Installing ANSYS prerequisite packages."
+log "Resolving available packages before installation."
 if [[ "$DRY_RUN" -eq 0 ]]; then
-  # Install in best-effort mode first. Rocky repositories can vary, so do not stop on first unavailable package.
-  if dnf -y install $(cat "$PKG_FILE") 2>&1 | tee -a "$LOG_FILE"; then
-    log "dnf install completed."
-  else
-    log "Initial dnf install reported an error. Trying package-by-package fallback to identify missing packages."
-  fi
-
-  MISSING_FILE="/tmp/ansys-missing-packages.$$"
+  AVAILABLE_FILE="/tmp/ansys-available-packages.$$"
+  MANDATORY_MISSING_FILE="/tmp/ansys-mandatory-missing-packages.$$"
+  OPTIONAL_MISSING_FILE="/tmp/ansys-optional-missing-packages.$$"
   INSTALLED_FILE="/tmp/ansys-installed-packages.$$"
-  : > "$MISSING_FILE"
+  : > "$AVAILABLE_FILE"
+  : > "$MANDATORY_MISSING_FILE"
+  : > "$OPTIONAL_MISSING_FILE"
   : > "$INSTALLED_FILE"
+
+  while read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    if pkg_available_or_installed "$pkg"; then
+      echo "$pkg" >> "$AVAILABLE_FILE"
+    else
+      if is_optional_pkg "$pkg"; then
+        echo "$pkg" >> "$OPTIONAL_MISSING_FILE"
+        log "Optional/vendor package not available; skipping: $pkg"
+      else
+        echo "$pkg" >> "$MANDATORY_MISSING_FILE"
+        log "Package not available in enabled repos; will report: $pkg"
+      fi
+    fi
+  done < "$PKG_FILE"
+
+  log "Installing available ANSYS prerequisite packages with dnf."
+  if [[ -s "$AVAILABLE_FILE" ]]; then
+    if dnf -y install --skip-broken $(cat "$AVAILABLE_FILE") 2>&1 | tee -a "$LOG_FILE"; then
+      log "dnf install completed for available package set."
+    else
+      log "Bulk dnf install reported an error. Trying package-by-package fallback."
+      while read -r pkg; do
+        [[ -n "$pkg" ]] || continue
+        rpm -q "$pkg" >/dev/null 2>&1 && continue
+        if ! dnf -y install "$pkg" >>"$LOG_FILE" 2>&1; then
+          if is_optional_pkg "$pkg"; then
+            grep -qxF "$pkg" "$OPTIONAL_MISSING_FILE" || echo "$pkg" >> "$OPTIONAL_MISSING_FILE"
+          else
+            grep -qxF "$pkg" "$MANDATORY_MISSING_FILE" || echo "$pkg" >> "$MANDATORY_MISSING_FILE"
+          fi
+        fi
+      done < "$AVAILABLE_FILE"
+    fi
+  fi
 
   while read -r pkg; do
     [[ -n "$pkg" ]] || continue
     if rpm -q "$pkg" >/dev/null 2>&1; then
       echo "$pkg" >> "$INSTALLED_FILE"
-      continue
-    fi
-    if dnf -y install "$pkg" >>"$LOG_FILE" 2>&1; then
-      echo "$pkg" >> "$INSTALLED_FILE"
-    else
-      echo "$pkg" >> "$MISSING_FILE"
     fi
   done < "$PKG_FILE"
 
@@ -414,12 +468,21 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
     echo "OS: ${PRETTY_NAME:-unknown}"
     echo
     echo "Requested packages: $(wc -l < "$PKG_FILE" | tr -d ' ')"
+    echo "Available packages attempted: $(wc -l < "$AVAILABLE_FILE" | tr -d ' ')"
     echo "Installed/resolved packages: $(wc -l < "$INSTALLED_FILE" | tr -d ' ')"
-    echo "Missing/unavailable packages: $(wc -l < "$MISSING_FILE" | tr -d ' ')"
+    echo "Mandatory missing/unavailable packages: $(wc -l < "$MANDATORY_MISSING_FILE" | tr -d ' ')"
+    echo "Optional/vendor missing/unavailable packages: $(wc -l < "$OPTIONAL_MISSING_FILE" | tr -d ' ')"
     echo
-    echo "Missing/unavailable package list:"
-    if [[ -s "$MISSING_FILE" ]]; then
-      cat "$MISSING_FILE"
+    echo "Mandatory missing/unavailable package list:"
+    if [[ -s "$MANDATORY_MISSING_FILE" ]]; then
+      cat "$MANDATORY_MISSING_FILE"
+    else
+      echo "None"
+    fi
+    echo
+    echo "Optional/vendor missing/unavailable package list:"
+    if [[ -s "$OPTIONAL_MISSING_FILE" ]]; then
+      cat "$OPTIONAL_MISSING_FILE"
     else
       echo "None"
     fi
@@ -430,14 +493,20 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
 
   log "Report written to $REPORT_FILE"
 
-  if [[ -s "$MISSING_FILE" ]]; then
-    log "WARNING: Some packages were not available from enabled repositories. Review $REPORT_FILE."
+  if [[ -s "$MANDATORY_MISSING_FILE" ]]; then
+    log "WARNING: Some mandatory packages were not available from enabled repositories. Review $REPORT_FILE."
     if [[ "$STRICT" -eq 1 ]]; then
-      fail "Missing packages found and --strict was specified."
+      fail "Mandatory missing packages found and --strict was specified."
     fi
   fi
 
-  rm -f "$MISSING_FILE" "$INSTALLED_FILE"
+  if [[ -s "$OPTIONAL_MISSING_FILE" ]]; then
+    log "Optional/vendor packages were unavailable and skipped. Review $REPORT_FILE."
+  fi
+
+  rm -f "$AVAILABLE_FILE" "$MANDATORY_MISSING_FILE" "$OPTIONAL_MISSING_FILE" "$INSTALLED_FILE"
+else
+  log "Dry run selected; no packages installed."
 fi
 
 # Useful post-install checks. These do not fail the script except in strict rpm package mode above.
