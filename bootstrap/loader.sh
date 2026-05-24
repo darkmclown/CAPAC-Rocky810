@@ -161,7 +161,7 @@ invoke_bootstrap() {
   echo ""
 
   while true; do
-    read -rp "Enter choice [1/2/3]: " loader_choice
+    read -rp "Enter choice [1/2/3]: " loader_choice < /dev/tty
 
     case "${loader_choice}" in
       1)
